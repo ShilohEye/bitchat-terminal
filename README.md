@@ -30,6 +30,15 @@ A terminal client for BitChat - the decentralized, encrypted mesh network chat p
 
 - If you are having issues building the binary you can run ``cargo build --release`` and manually move the binary to ```/usr/local/bin``` 
 
+## Running with Docker
+```
+docker run --rm -it --privileged \
+  -v /dev:/dev \
+  --env DBUS_SYSTEM_BUS_ADDRESS=unix:path=/host/run/dbus/system_bus_socket \
+  -v /run/dbus:/host/run/dbus \
+  bitchat-terminal
+```
+
 ## Installing Rust (First Time Users)
 
 If you don't have Rust installed:
