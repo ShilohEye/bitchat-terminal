@@ -31,6 +31,15 @@ A terminal client for BitChat - the decentralized, encrypted mesh network chat p
 - If you are having issues building the binary you can run ``cargo build --release`` and manually move the binary to ```/usr/local/bin``` 
 
 ## Running with Docker
+
+Build the image locally.
+```
+git clone https://github.com/ShilohEye/bitchat-terminal.git
+cd bitchat-terminal
+docker build -t bitchat-terminal .
+```
+
+Run the container (with Bluetooth support)
 ```
 docker run --rm -it --privileged \
   -v /dev:/dev \
