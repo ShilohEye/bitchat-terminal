@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use futures::stream::StreamExt;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use std::convert::TryInto;
 
@@ -275,6 +275,233 @@ impl FragmentCollector {
     }
 }
 
+struct MessageCache {
+    regular_messages: HashMap<String, Vec<(Vec<u8>, SystemTime)>>, // peer_id -> [(message, timestamp)]
+    favorite_messages: HashMap<String, Vec<Vec<u8>>>, // peer_id -> [messages] (no TTL)
+    max_regular_messages: usize,
+    max_favorite_messages: usize,
+}
+
+impl MessageCache {
+    fn new() -> Self {
+        Self {
+            regular_messages: HashMap::new(),
+            favorite_messages: HashMap::new(),
+            max_regular_messages: 100,    // 100 msg limit (refer: https://github.com/permissionlesstech/bitchat/blob/main/WHITEPAPER.md)
+            max_favorite_messages: 1000,  // 1000 msg limit (refer: https://github.com/permissionlesstech/bitchat/blob/main/WHITEPAPER.md)
+        }
+    }
+    
+    fn cache_message(&mut self, peer_id: &str, message: Vec<u8>, is_favorite: bool) {
+        if is_favorite {
+            let messages = self.favorite_messages.entry(peer_id.to_string()).or_default();
+            messages.push(message);
+            
+            if messages.len() > self.max_favorite_messages {
+                messages.remove(0);
+            }
+        } else {
+            let messages = self.regular_messages.entry(peer_id.to_string()).or_default();
+            messages.push((message, SystemTime::now()));
+            
+            if messages.len() > self.max_regular_messages {
+                messages.remove(0);
+            }
+        }
+        
+        debug_println!("[CACHE] Stored message for {} (favorite: {})", peer_id, is_favorite);
+    }
+    
+    fn get_cached_messages(&mut self, peer_id: &str) -> Vec<Vec<u8>> {
+        let mut all_messages = Vec::new();
+        
+        // get regular msg (check 12-hour TTL)
+        if let Some(messages) = self.regular_messages.get_mut(peer_id) {
+            let now = SystemTime::now();
+            messages.retain(|(_, timestamp)| {
+                now.duration_since(*timestamp).unwrap_or_default() < Duration::from_secs(12 * 3600)
+            });
+            
+            for (msg, _) in messages.iter() {
+                all_messages.push(msg.clone());
+            }
+        }
+        
+        // get fav msg (no TTL)
+        if let Some(messages) = self.favorite_messages.get(peer_id) {
+            all_messages.extend(messages.clone());
+        }
+        
+        if !all_messages.is_empty() {
+            debug_println!("[CACHE] Retrieved {} cached messages for {}", all_messages.len(), peer_id);
+        }
+        
+        all_messages
+    }
+    
+    fn cleanup_expired(&mut self) {
+        let now = SystemTime::now();
+        self.regular_messages.retain(|_, messages| {
+            messages.retain(|(_, timestamp)| {
+                now.duration_since(*timestamp).unwrap_or_default() < Duration::from_secs(12 * 3600)
+            });
+            !messages.is_empty()
+        });
+    }
+}
+
+
+struct MessageQueue {
+    pending: HashMap<String, VecDeque<(Vec<u8>, SystemTime, u32)>>, // peer_id -> [(message, timestamp, retry_count)]
+    max_retries: u32,
+    retry_delay: Duration,
+}
+
+impl MessageQueue {
+    fn new() -> Self {
+        Self {
+            pending: HashMap::new(),
+            max_retries: 3,
+            retry_delay: Duration::from_secs(5),
+        }
+    }
+    
+    fn queue_message(&mut self, peer_id: &str, message: Vec<u8>) {
+        let queue = self.pending.entry(peer_id.to_string()).or_default();
+        queue.push_back((message, SystemTime::now(), 0)); // Start with retry_count = 0
+        debug_println!("[QUEUE] Queued message for {}", peer_id);
+    }
+    
+    fn get_next_message(&mut self, peer_id: &str) -> Option<Vec<u8>> {
+        if let Some(queue) = self.pending.get_mut(peer_id) {
+            if let Some((_message, timestamp, retry_count)) = queue.front() {
+                
+                // first attempt instant then with some time
+                let should_send = if *retry_count == 0 {
+                    true
+                } else {
+                    timestamp.elapsed().unwrap_or_default() >= self.retry_delay
+                };
+                
+                if should_send {
+                    let (msg, _, count) = queue.pop_front().unwrap();
+                    
+                    // if haven't exceeded max retries requeue for potential retry
+                    if count < self.max_retries {
+                        queue.push_back((msg.clone(), SystemTime::now(), count + 1));
+                    } else {
+                        debug_println!("[QUEUE] Message for {} exceeded max retries, dropping", peer_id);
+                    }
+                    
+                    return Some(msg);
+                }
+            }
+        }
+        None
+    }
+    
+    fn mark_delivered(&mut self, peer_id: &str) {
+        if let Some(queue) = self.pending.get_mut(peer_id) {
+            if !queue.is_empty() {
+                queue.pop_front(); // remove successfully delivered msg
+                debug_println!("[QUEUE] Message delivered to {}", peer_id);
+            }
+        }
+    }
+}
+
+struct ConnectionHealth {
+    last_seen: HashMap<String, SystemTime>,
+    connection_timeout: Duration,
+    write_timeout: Duration,
+}
+
+impl ConnectionHealth {
+    fn new() -> Self {
+        Self {
+            last_seen: HashMap::new(),
+            connection_timeout: Duration::from_secs(30), // consider peer offline after 30s
+            write_timeout: Duration::from_secs(5),
+        }
+    }
+    
+    fn update_peer_activity(&mut self, peer_id: &str) {
+        self.last_seen.insert(peer_id.to_string(), SystemTime::now());
+        debug_println!("[HEALTH] Updated activity for peer {}", peer_id);
+    }
+    
+    fn is_peer_online(&self, peer_id: &str) -> bool {
+        if let Some(last_seen) = self.last_seen.get(peer_id) {
+            SystemTime::now().duration_since(*last_seen).unwrap_or_default() < self.connection_timeout
+        } else {
+            false
+        }
+    }
+    
+    fn get_offline_peers(&self) -> Vec<String> {
+        let now = SystemTime::now();
+        self.last_seen.iter()
+            .filter_map(|(peer_id, last_seen)| {
+                if now.duration_since(*last_seen).unwrap_or_default() > self.connection_timeout {
+                    Some(peer_id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+    
+    fn remove_peer(&mut self, peer_id: &str) {
+        self.last_seen.remove(peer_id);
+    }
+}
+
+async fn send_with_cache_timeout(
+    peripheral: &Peripheral,
+    cmd_char: &Characteristic,
+    packet: Vec<u8>,
+    target_peer_id: Option<&str>,
+    message_cache: &mut MessageCache,
+    _message_queue: &mut MessageQueue,
+    connection_health: &ConnectionHealth,
+    is_favorite: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // if target peer is known to be online
+    if let Some(peer_id) = target_peer_id {
+        if !connection_health.is_peer_online(peer_id) {
+            message_cache.cache_message(peer_id, packet, is_favorite);
+            debug_println!("[CACHE] Message cached for {} (peer offline)", peer_id);
+            return Err("Peer offline".into());
+        }
+    }
+    
+    // timeout for write operation
+    let write_future = peripheral.write(cmd_char, &packet, WriteType::WithoutResponse);
+    let timeout_duration = connection_health.write_timeout;
+    
+    match tokio::time::timeout(timeout_duration, write_future).await {
+        Ok(Ok(_)) => {
+            debug_println!("[SEND] Message sent successfully");
+            Ok(())
+        },
+        Ok(Err(e)) => {
+            // BLE write failed
+            if let Some(peer_id) = target_peer_id {
+                message_cache.cache_message(peer_id, packet, is_favorite);
+                debug_println!("[CACHE] Message cached for {} due to BLE error: {}", peer_id, e);
+            }
+            Err(e.into())
+        },
+        Err(_) => {
+            // timeout occurred
+            if let Some(peer_id) = target_peer_id {
+                message_cache.cache_message(peer_id, packet, is_favorite);
+                debug_println!("[CACHE] Message cached for {} due to write timeout", peer_id);
+            }
+            Err("Write timeout".into())
+        }
+    }
+}
 
 #[tokio::main]
 
@@ -414,16 +641,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let encryption_service = Arc::new(EncryptionService::new());
     let (key_exchange_payload, _) = generate_keys_and_payload(&encryption_service);
 
+    let mut message_cache = MessageCache::new();
+    let mut message_queue = MessageQueue::new();
+    let mut last_cleanup = SystemTime::now(); // cleanup timer for cache
+    let mut connection_health = ConnectionHealth::new();
+
     let key_exchange_packet = create_bitchat_packet(&my_peer_id, MessageType::KeyExchange, key_exchange_payload);
 
-    peripheral.write(cmd_char, &key_exchange_packet, WriteType::WithoutResponse).await?;
+    let _ = send_with_cache_timeout(&peripheral, cmd_char, key_exchange_packet, None, &mut message_cache, &mut message_queue, &connection_health, false).await;
 
     // Add delay between key exchange and announce to ensure Android processes them properly
     time::sleep(Duration::from_millis(500)).await;
 
     let announce_packet = create_bitchat_packet(&my_peer_id, MessageType::Announce, nickname.as_bytes().to_vec());
 
-    peripheral.write(cmd_char, &announce_packet, WriteType::WithoutResponse).await?;
+    let _ = send_with_cache_timeout(&peripheral, cmd_char, announce_packet, None, &mut message_cache, &mut message_queue, &connection_health, false).await;
 
     debug_println!("[3] Handshake sent. You can now chat.");
     if app_state.nickname.is_some() {
@@ -698,7 +930,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         owner, // Use existing owner
                                         &channel_name,
                                         true,
-                                        Some(&key_commitment)
+                                        Some(&key_commitment),
+                                        &mut message_cache,
+                                        &mut message_queue,
+                                        &connection_health,
                                     ).await;
                                 }
                                 
@@ -735,7 +970,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         owner, // Use existing owner
                                         &channel_name,
                                         true,
-                                        Some(&key_commitment)
+                                        Some(&key_commitment),
+                                        &mut message_cache,
+                                        &mut message_queue,
+                                        &connection_health,
                                     ).await;
                                 }
                                 
@@ -939,8 +1177,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 );
                                 
                                 // Send the private message
-                                if let Err(_e) = send_packet_with_fragmentation(&peripheral, cmd_char, packet, &my_peer_id).await {
+                                if let Err(_e) = send_packet_with_fragmentation(&peripheral, cmd_char, packet, &target_peer_id, &mut message_cache, &mut message_queue, &connection_health).await {
                                     println!("\n\x1b[91m❌ Failed to send private message\x1b[0m");
+                                    println!("\x1b[90mMessage cached for delivery when {} comes online\x1b[0m", target_nickname);
                                     println!("\x1b[90mThe message could not be delivered. Connection may have been lost.\x1b[0m");
                                 } else {
                                     debug_println!("[PRIVATE] Message sent to {}", target_nickname);
@@ -1320,7 +1559,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 &nickname, notify_msg, channel, &old_key, &encryption_service, &my_peer_id
                                             );
                                             let notify_packet = create_bitchat_packet(&my_peer_id, MessageType::Message, notify_payload);
-                                            let _ = send_packet_with_fragmentation(&peripheral, cmd_char, notify_packet, &my_peer_id).await;
+                                            let _ = send_packet_with_fragmentation(&peripheral, cmd_char, notify_packet, &my_peer_id, &mut message_cache, &mut message_queue, &connection_health).await;
                                         }
                                     }
                                     
@@ -1332,6 +1571,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         channel,
                                         true,
                                         Some(&commitment_hex),
+                                        &mut message_cache,
+                                        &mut message_queue,
+                                        &connection_health,
                                     ).await {
                                         println!("[!] Failed to announce password change: {}", e);
                                     }
@@ -1349,7 +1591,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         &nickname, &init_msg, channel, &new_key, &encryption_service, &my_peer_id
                                     );
                                     let init_packet = create_bitchat_packet(&my_peer_id, MessageType::Message, init_payload);
-                                    let _ = send_packet_with_fragmentation(&peripheral, cmd_char, init_packet, &my_peer_id).await;
+                                    let _ = send_packet_with_fragmentation(&peripheral, cmd_char, init_packet, &my_peer_id, &mut message_cache, &mut message_queue, &connection_health).await;
                                     
                                     // Save state
                                     let state_to_save = create_app_state(
@@ -1420,7 +1662,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     &my_peer_id,
                                     channel,
                                     true,
-                                    Some(&commitment_hex)
+                                    Some(&commitment_hex),
+                                    &mut message_cache,
+                                    &mut message_queue,
+                                    &connection_health
                                 ).await {
                                     eprintln!("Failed to send channel announce: {}", e);
                                 }
@@ -1512,7 +1757,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         };
                                         
                                         // Send announce packet with new owner
-                                        match send_channel_announce(&peripheral, &cmd_char, &new_owner_id, channel, is_protected, key_commitment.as_deref()).await {
+                                        match send_channel_announce(&peripheral, &cmd_char, &new_owner_id, channel, is_protected, key_commitment.as_deref(), &mut message_cache, &mut message_queue, &connection_health).await {
                                             Ok(_) => {
                                                 println!("» Transferred ownership of {} to {}", channel, target_name);
                                             }
@@ -1599,9 +1844,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             );
                             
                             // Send the private message
-                            if let Err(_e) = send_packet_with_fragmentation(&peripheral, cmd_char, packet, &my_peer_id).await {
+                            if let Err(_e) = send_packet_with_fragmentation(&peripheral, cmd_char, packet, &my_peer_id, &mut message_cache, &mut message_queue, &connection_health).await {
                                 println!("\n\x1b[91m❌ Failed to send private message\x1b[0m");
-                                    println!("\x1b[90mThe message could not be delivered. Connection may have been lost.\x1b[0m");
+                                println!("\x1b[90mMessage cached for delivery when {} comes online\x1b[0m", target_nickname);
+                                println!("\x1b[90mThe message could not be delivered. Connection may have been lost.\x1b[0m");
                             } else {
                                 // Show the message was sent in a cleaner format
                                 let timestamp = chrono::Local::now();
@@ -1675,8 +1921,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     debug_println!("[MESSAGE] Complete packet ({} bytes) requires fragmentation", message_packet.len());
                     
                     // Use Swift-compatible fragmentation for complete packet
-                    if let Err(_e) = send_packet_with_fragmentation(&peripheral, cmd_char, message_packet, &my_peer_id).await {
+                    if let Err(_e) = send_packet_with_fragmentation(&peripheral, cmd_char, message_packet, &my_peer_id, &mut message_cache, &mut message_queue, &connection_health).await {
                         println!("\n\x1b[91m❌ Message delivery failed\x1b[0m");
+                        println!("\x1b[90mMessage cached for later delivery\x1b[0m");
                         println!("\x1b[90mConnection lost. Please restart BitChat to reconnect.\x1b[0m");
                         break;
                     }
@@ -1737,6 +1984,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                      match packet.msg_type {
 
                          MessageType::Announce => {
+                             connection_health.update_peer_activity(&packet.sender_id_str);
                              let peer_nickname = String::from_utf8_lossy(&packet.payload).trim().to_string();
 
                              let is_new_peer = !peers_lock.contains_key(&packet.sender_id_str);
@@ -1751,11 +1999,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                  std::io::stdout().flush().unwrap();
                              }
                              
+                             let cached_messages = message_cache.get_cached_messages(&packet.sender_id_str);
+                             for cached_msg in cached_messages {
+                                 message_queue.queue_message(&packet.sender_id_str, cached_msg);
+                             }
+
                              debug_println!("[<-- RECV] Announce: Peer {} is now known as '{}'", packet.sender_id_str, peer_nickname);
 
                          },
 
                          MessageType::Message => {
+                             connection_health.update_peer_activity(&packet.sender_id_str);
                              debug_full_println!("[DEBUG] ==================== MESSAGE RECEIVED ====================");
                              debug_full_println!("[DEBUG] Sender: {}", packet.sender_id_str);
                              
@@ -2055,6 +2309,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                          },
                          MessageType::FragmentStart | MessageType::FragmentContinue | MessageType::FragmentEnd => {
+                            connection_health.update_peer_activity(&packet.sender_id_str);
                              // Handle fragment (simplified, following working example)
                              if packet.payload.len() >= 13 {
                                  let mut fragment_id = [0u8; 8];
@@ -2179,6 +2434,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                              }
                          },
                          MessageType::KeyExchange => {
+                            connection_health.update_peer_activity(&packet.sender_id_str);
                              // Extract public key
                              let public_key = packet.payload.clone();
                              debug_println!("[<-- RECV] Key exchange from {} (key: {} bytes)", packet.sender_id_str, public_key.len());
@@ -2202,6 +2458,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                              }
                          },
                          MessageType::Leave => {
+                            connection_health.update_peer_activity(&packet.sender_id_str);
                              // Handle leave notification
                              let payload_str = String::from_utf8_lossy(&packet.payload).trim().to_string();
                              
@@ -2229,6 +2486,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                          },
                          
                          MessageType::ChannelAnnounce => {
+                            connection_health.update_peer_activity(&packet.sender_id_str);
                              // Parse channel announce: "channel|isProtected|creatorID|keyCommitment"
                              let payload_str = String::from_utf8_lossy(&packet.payload);
                              let parts: Vec<&str> = payload_str.split('|').collect();
@@ -2282,6 +2540,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                          },
 
                          MessageType::DeliveryAck => {
+                            connection_health.update_peer_activity(&packet.sender_id_str);
                             debug_println!("[<-- RECV] Delivery ACK from {}", packet.sender_id_str);
                             
                             // Check if this ACK is for us
@@ -2324,11 +2583,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         },
                         
                         MessageType::DeliveryStatusRequest => {
+                            connection_health.update_peer_activity(&packet.sender_id_str);
                             // iOS defines this but doesn't implement it yet
                             debug_println!("[<-- RECV] Delivery status request (not implemented)");
                         },
                         
                         MessageType::ReadReceipt => {
+                            connection_health.update_peer_activity(&packet.sender_id_str);
                             // iOS defines this but doesn't implement it yet
                             debug_println!("[<-- RECV] Read receipt (not implemented)");
                         },
@@ -2343,7 +2604,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             },
 
-             _ = tokio::signal::ctrl_c() => { break; }
+            _ = time::sleep(Duration::from_secs(60)) => {
+                // periodic maintenance (every minute)
+                if last_cleanup.elapsed().unwrap_or_default() > Duration::from_secs(300) {
+                    message_cache.cleanup_expired();
+                    last_cleanup = SystemTime::now();
+                    debug_println!("[MAINTENANCE] Cleaned up expired cached messages");
+                }
+                
+                // check for offline peers and remove them
+                let offline_peers = connection_health.get_offline_peers();
+                let mut peers_lock = peers.lock().unwrap();
+                
+                for peer_id in offline_peers {
+                    if let Some(peer) = peers_lock.remove(&peer_id) {
+                        if let Some(nickname) = &peer.nickname {
+                            print!("\r\x1b[K\x1b[31m{} disconnected (timeout)\x1b[0m\n> ", nickname);
+                            std::io::stdout().flush().unwrap();
+                        }
+                        connection_health.remove_peer(&peer_id);
+                        debug_println!("[HEALTH] Removed offline peer: {}", peer_id);
+                    }
+                }
+                drop(peers_lock);
+                
+                // try to send queued messages (with timeout)
+                let peer_ids: Vec<String> = peers.lock().unwrap().keys().cloned().collect();
+                for peer_id in peer_ids {
+                    if let Some(msg) = message_queue.get_next_message(&peer_id) {
+                        let write_future = peripheral.write(cmd_char, &msg, WriteType::WithoutResponse);
+                        if tokio::time::timeout(Duration::from_secs(5), write_future).await.is_ok() {
+                            message_queue.mark_delivered(&peer_id);
+                            debug_println!("[QUEUE] Delivered queued message to {}", peer_id);
+                        } else {
+                            debug_println!("[QUEUE] Failed to deliver queued message to {} (timeout)", peer_id);
+                        }
+                    }
+                }
+            },
+
+            _ = tokio::signal::ctrl_c() => { break; }
 
         }
 
@@ -3018,7 +3318,10 @@ async fn send_packet_with_fragmentation(
     peripheral: &Peripheral,
     cmd_char: &btleplug::api::Characteristic,
     packet: Vec<u8>,
-    my_peer_id: &str
+    my_peer_id: &str,
+    message_cache: &mut MessageCache,
+    message_queue: &mut MessageQueue,
+    connection_health: &ConnectionHealth,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Swift's logic: if packet > 500 bytes, fragment it
     if packet.len() > 500 {
@@ -3134,8 +3437,8 @@ async fn send_packet_with_fragmentation(
             }
             
             // Send fragment
-            if peripheral.write(cmd_char, &fragment_packet, WriteType::WithoutResponse).await.is_err() {
-                return Err(format!("Failed to send fragment {}/{} (size: {} bytes)", index + 1, total_fragments, fragment_packet.len()).into());
+            if send_with_cache_timeout(peripheral, cmd_char, fragment_packet, Some(my_peer_id), message_cache, message_queue, &connection_health, false).await.is_err() {
+                return Err(format!("Failed to send fragment {}/{}", index + 1, total_fragments).into());
             }
             
             println!("[FRAG] ✓ Fragment {}/{} sent successfully", index + 1, total_fragments);
@@ -3151,13 +3454,13 @@ async fn send_packet_with_fragmentation(
         Ok(())
     } else {
         // Packet is small enough, send directly
-        let write_type = if packet.len() > 512 {
+        let _write_type = if packet.len() > 512 {
             WriteType::WithResponse
         } else {
             WriteType::WithoutResponse
         };
         
-        if peripheral.write(cmd_char, &packet, write_type).await.is_err() {
+        if send_with_cache_timeout(peripheral, cmd_char, packet.clone(), Some(my_peer_id), message_cache, message_queue, connection_health, false).await.is_err() {
             return Err(format!("Failed to send {} byte packet", packet.len()).into());
         }
         
@@ -3172,6 +3475,9 @@ async fn send_channel_announce(
     channel: &str,
     is_protected: bool,
     key_commitment: Option<&str>,
+    message_cache: &mut MessageCache,
+    message_queue: &mut MessageQueue,
+    connection_health: &ConnectionHealth,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Format: "channel|isProtected|creatorID|keyCommitment"
     let protected_str = if is_protected { "1" } else { "0" };
@@ -3194,7 +3500,7 @@ async fn send_channel_announce(
     packet_with_ttl[2] = 5; // TTL is at offset 2
     
     debug_println!("[CHANNEL] Sending channel announce for {}", channel);
-    send_packet_with_fragmentation(&peripheral, cmd_char, packet_with_ttl, my_peer_id).await
+    send_packet_with_fragmentation(&peripheral, cmd_char, packet_with_ttl, my_peer_id, message_cache, message_queue, connection_health).await
 }
 
 #[cfg(test)]
@@ -3225,8 +3531,175 @@ mod tests {
         assert_eq!(FLAG_HAS_RECIPIENT, 0x01);
         assert_eq!(FLAG_HAS_SIGNATURE, 0x02);
         assert_eq!(FLAG_IS_COMPRESSED, 0x04);
-        assert_eq!(FLAG_HAS_CHANNEL, 0x40);
+        assert_eq!(MSG_FLAG_HAS_CHANNEL, 0x40);
         assert_eq!(SIGNATURE_SIZE, 64);
         assert_eq!(BROADCAST_RECIPIENT, [0xFF; 8]);
+    }
+
+    #[test]
+    fn test_message_cache_basic_functionality() {
+        let mut cache = MessageCache::new();
+        let peer_id = "test_peer";
+        let message = b"Hello, World!".to_vec();
+        
+        cache.cache_message(peer_id, message.clone(), false);
+        let cached = cache.get_cached_messages(peer_id);
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0], message);
+    }
+    
+    #[test]
+    fn test_message_cache_favorite_vs_regular() {
+        let mut cache = MessageCache::new();
+        let peer_id = "test_peer";
+        let regular_msg = b"Regular message".to_vec();
+        let favorite_msg = b"Favorite message".to_vec();
+        
+        cache.cache_message(peer_id, regular_msg.clone(), false);
+        cache.cache_message(peer_id, favorite_msg.clone(), true);
+        
+        let cached = cache.get_cached_messages(peer_id);
+        assert_eq!(cached.len(), 2);
+        assert!(cached.contains(&regular_msg));
+        assert!(cached.contains(&favorite_msg));
+    }
+    
+    #[test]
+    fn test_message_cache_limits() {
+        let mut cache = MessageCache::new();
+        let peer_id = "test_peer";
+        
+        for i in 0..150 {
+            let message = format!("Message {}", i).into_bytes();
+            cache.cache_message(peer_id, message, false);
+        }
+        
+        let cached = cache.get_cached_messages(peer_id);
+        assert_eq!(cached.len(), 100); // should be ltd to 100
+        
+        // test favorite msg limit (1000)
+        let mut cache2 = MessageCache::new();
+        for i in 0..1200 {
+            let message = format!("Favorite {}", i).into_bytes();
+            cache2.cache_message(peer_id, message, true);
+        }
+        
+        let cached_favorites = cache2.get_cached_messages(peer_id);
+        assert_eq!(cached_favorites.len(), 1000); // should be ltd to 1000
+    }
+    
+    #[test]
+    fn test_message_cache_ttl_cleanup() {
+        let mut cache = MessageCache::new();
+        let peer_id = "test_peer";
+        
+        // ,anually insert an expired message
+        let expired_time = SystemTime::now() - Duration::from_secs(13 * 3600); // 13 hours ago
+        cache.regular_messages.insert(
+            peer_id.to_string(), 
+            vec![(b"Expired message".to_vec(), expired_time)]
+        );
+        
+        cache.cache_message(peer_id, b"Fresh message".to_vec(), false);
+        
+        // get msg should filter out expired ones
+        let cached = cache.get_cached_messages(peer_id);
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0], b"Fresh message".to_vec());
+    }
+    
+    #[test]
+    fn test_message_queue_basic_functionality() {
+        let mut queue = MessageQueue::new();
+        let peer_id = "test_peer";
+        let message = b"Test message".to_vec();
+        
+        queue.queue_message(peer_id, message.clone());
+        
+        // Should be able to get it immediately (first attempt, retry_count = 0)
+        let retrieved = queue.get_next_message(peer_id);
+        assert!(retrieved.is_some());
+        assert_eq!(retrieved.unwrap(), message);
+        
+        // After getting the msg, it should be re-queued for potential retry
+        // But since we haven't marked it as delivered, it should still be there
+        // However, it won't be available immediately due to retry delay
+        let immediate_retry = queue.get_next_message(peer_id);
+        assert!(immediate_retry.is_none()); // None due to retry delay
+    }
+
+    
+    #[test]
+    fn test_message_queue_retry_logic() {
+        let mut queue = MessageQueue::new();
+        let peer_id = "test_peer";
+        let message = b"Test message".to_vec();
+        
+        queue.queue_message(peer_id, message.clone());
+        
+        // get it once (simulates failed send) should work immediately
+        let first_attempt = queue.get_next_message(peer_id);
+        assert!(first_attempt.is_some());
+        assert_eq!(first_attempt.unwrap(), message);
+        
+        // shouldn't be available immediately (retry delay)
+        let immediate_retry = queue.get_next_message(peer_id);
+        assert!(immediate_retry.is_none());
+        
+        // manually set an old timestamp to simulate time passing
+        if let Some(queue_for_peer) = queue.pending.get_mut(peer_id) {
+            if let Some((msg, _, count)) = queue_for_peer.pop_front() {
+                // set timestamp to 6 seconds ago (past the 5-second retry delay)
+                let old_time = SystemTime::now() - Duration::from_secs(6);
+                queue_for_peer.push_front((msg, old_time, count));
+            }
+        }
+        
+        // should be available for retry
+        let retry_attempt = queue.get_next_message(peer_id);
+        assert!(retry_attempt.is_some());
+        assert_eq!(retry_attempt.unwrap(), message);
+    }
+    
+    #[test]
+    fn test_message_queue_max_retries() {
+        let mut queue = MessageQueue::new();
+        let peer_id = "test_peer";
+        let message = b"Test message".to_vec();
+        
+        // manually insert a message that has already been retried max times
+        let old_time = SystemTime::now() - Duration::from_secs(10);
+        queue.pending.insert(
+            peer_id.to_string(),
+            VecDeque::from([(message.clone(), old_time, queue.max_retries)]) // at max retries
+        );
+        
+        // should get the msg one last time, but not re-queue it
+        let last_attempt = queue.get_next_message(peer_id);
+        assert!(last_attempt.is_some());
+        assert_eq!(last_attempt.unwrap(), message);
+        
+        // should be empty (no more retries)
+        let no_more_retries = queue.get_next_message(peer_id);
+        assert!(no_more_retries.is_none());
+    }
+    
+    #[test]
+    fn test_message_queue_mark_delivered() {
+        let mut queue = MessageQueue::new();
+        let peer_id = "test_peer";
+        let message = b"Test message".to_vec();
+        
+        queue.queue_message(peer_id, message.clone());
+        
+        // get the msg (this re-queues it for retry)
+        let retrieved = queue.get_next_message(peer_id);
+        assert!(retrieved.is_some());
+        
+        // mark as delivered (this should remove it from queue)
+        queue.mark_delivered(peer_id);
+        
+        let should_be_empty = queue.get_next_message(peer_id);
+        assert!(should_be_empty.is_none());
     }
 } 
