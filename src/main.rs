@@ -599,16 +599,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     debug_println!("[NOISE] Our identity fingerprint: {}", identity_fingerprint);
 
-    // Create handshake initiation packet (we'll initiate with discovered peers)
-    // For now, just send our static public key in the announce
-    let announce_payload = format!("{}|{}", nickname, hex::encode(&static_public_key));
+    // Send NoiseIdentityAnnounce instead of old Announce format (matching Swift protocol)
+    let identity_announcement = NoiseIdentityAnnouncement {
+        peer_id: my_peer_id.clone(),
+        public_key: static_public_key.clone(),
+        nickname: nickname.clone(),
+        timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+        previous_peer_id: None,
+        signature: vec![], // We'll add proper signature later if needed
+    };
+    
+    let identity_payload = serde_json::to_vec(&identity_announcement).unwrap();
 
     // Add small delay before announcing
     time::sleep(Duration::from_millis(200)).await;
 
-    let announce_packet = create_bitchat_packet(&my_peer_id, MessageType::Announce, announce_payload.as_bytes().to_vec());
+    let announce_packet = create_bitchat_packet(&my_peer_id, MessageType::NoiseIdentityAnnounce, identity_payload);
 
     peripheral.write(cmd_char, &announce_packet, WriteType::WithoutResponse).await?;
+    
+    debug_println!("[IDENTITY] Sent NoiseIdentityAnnounce for peer {} ({})", my_peer_id, nickname);
 
     debug_println!("[3] Handshake sent. You can now chat.");
     if app_state.nickname.is_some() {
@@ -3614,7 +3624,8 @@ fn create_bitchat_packet_with_recipient(sender_id_str: &str, recipient_id_str: O
     debug_full_println!("[PACKET] Header: version={}, type=0x{:02X}, ttl={}, flags=0x{:02X}, payload_len={}", 
             version, msg_type_byte, ttl, flags, payload_length);
     
-    // 7. Sender ID (8 bytes) - Use ASCII bytes directly, pad with zeros
+    // 7. Sender ID (8 bytes) - Convert hex string to bytes, then use as ASCII
+    // If sender_id_str is a hex string like "04fbc83c", we store it as ASCII bytes
     let mut sender_id_bytes = sender_id_str.as_bytes().to_vec();
     if sender_id_bytes.len() < 8 {
         sender_id_bytes.resize(8, 0);
