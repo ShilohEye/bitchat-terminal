@@ -13,7 +13,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 # Copy dependency files first for caching
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml ./
 
 # Create a dummy main.rs to satisfy cargo build
 RUN mkdir src && echo "fn main() {}" > src/main.rs

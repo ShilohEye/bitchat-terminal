@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   bitchat-terminal:
     build:
@@ -31,17 +29,7 @@ services:
     stdin_open: true
     tty: true
     
-    # Restart policy
-    restart: unless-stopped
     
-    # Health check
-    healthcheck:
-      test: ["CMD", "/usr/local/bin/bitchat", "--help"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 10s
-
 volumes:
   bitchat-data:
     driver: local

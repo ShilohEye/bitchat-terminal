@@ -64,7 +64,6 @@ impl NoiseIntegrationService {
     }
 
     // Initiate handshake with a peer
-    #[allow(dead_code)]
     pub fn initiate_handshake(&self, peer_id: &str) -> Result<Vec<u8>, NoiseError> {
         // Simple rate limiting - max 1 handshake per 10 seconds per peer
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
@@ -456,5 +455,22 @@ mod tests {
         let decrypted = responder.decrypt_from_peer("initiator", &encrypted).unwrap();
         
         assert_eq!(plaintext, decrypted.as_slice());
+    }
+
+    #[test]
+    fn test_automatic_handshake_initiation() {
+        let initiator = NoiseIntegrationService::new().unwrap();
+        
+        // Trying to encrypt for a peer without established session should fail
+        let plaintext = b"Hello, World!";
+        let result = initiator.encrypt_for_peer("unknown_peer", plaintext);
+        assert!(matches!(result, Err(NoiseError::SessionNotFound)));
+        
+        // But we should be able to initiate a handshake
+        let handshake_msg = initiator.initiate_handshake("unknown_peer").unwrap();
+        assert!(!handshake_msg.is_empty());
+        
+        // After initiating, there should be a session in progress (but not established)
+        assert!(!initiator.has_established_session("unknown_peer"));
     }
 }

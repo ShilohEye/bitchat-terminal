@@ -964,43 +964,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                         } else {
-                            // Fall back to legacy encryption for peers without Noise sessions
-                            match noise_service.encrypt_for_peer(&target_peer_id, &padded_payload) {
-                                Ok(encrypted) => {
-                                    debug_println!("[PRIVATE] Encrypted payload (legacy): {} bytes", encrypted.len());
+                            // No Noise session established - initiate handshake first
+                            println!("» Initiating secure handshake with {}...", target_nickname);
+                            
+                            match noise_service.initiate_handshake(&target_peer_id) {
+                                Ok(handshake_msg) => {
+                                    debug_println!("[HANDSHAKE] Initiated handshake with {}, sending {} bytes", target_peer_id, handshake_msg.len());
                                     
-                                    // Sign the encrypted payload
-                                    let signature = noise_service.sign(&encrypted);
-                                    
-                                    // Create packet with recipient ID for private routing
-                                    let packet = create_bitchat_packet_with_recipient_and_signature(
+                                    // Create packet for handshake message
+                                    let packet = create_bitchat_packet_with_recipient(
                                         &my_peer_id,
-                                        &target_peer_id,  // Specify the recipient
-                                        MessageType::Message,
-                                        encrypted,
-                                        Some(signature)
+                                        Some(&target_peer_id),
+                                        MessageType::NoiseHandshake,
+                                        handshake_msg,
+                                        None
                                     );
                                     
-                                    // Send the private message
+                                    // Send handshake message
                                     if let Err(_e) = send_packet_with_fragmentation(&peripheral, cmd_char, packet, &my_peer_id).await {
-                                        println!("\n\x1b[91m❌ Failed to send private message\x1b[0m");
-                                        println!("\x1b[90mThe message could not be delivered. Connection may have been lost.\x1b[0m");
+                                        println!("\x1b[91m❌ Failed to send handshake\x1b[0m");
                                     } else {
-                                        debug_println!("[PRIVATE] Message sent to {}", target_nickname);
+                                        println!("» Handshake initiated. Please wait for response and try sending the message again.");
                                     }
                                 },
-                            Err(e) => {
-                                println!("[!] Failed to encrypt private message: {:?}", e);
-                                println!("[!] Make sure you have received key exchange from {}", target_nickname);
+                                Err(e) => {
+                                    println!("[!] Failed to initiate handshake: {:?}", e);
+                                    println!("[!] Unable to establish secure connection with {}", target_nickname);
+                                }
                             }
                         }
-                    }
-                    continue;
-                } else {
+                    } else {
                         println!("\x1b[93m⚠ User '{}' not found\x1b[0m", target_nickname);
                         println!("\x1b[90mThey may be offline or using a different nickname.\x1b[0m");
-                        continue;
                     }
+                    continue;
                 }
 
                 // NOTE: DM mode handling removed from here - moved after command checks to allow commands in DM mode
@@ -1660,48 +1657,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                     } else {
-                        // Fall back to legacy encryption for peers without Noise sessions
-                        match noise_service.encrypt_for_peer(target_peer_id, &padded_payload) {
-                            Ok(encrypted) => {
-                                debug_println!("[PRIVATE] Encrypted payload (legacy): {} bytes", encrypted.len());
+                        // No Noise session established - initiate handshake first
+                        println!("» Initiating secure handshake with {}...", target_nickname);
+                        
+                        match noise_service.initiate_handshake(target_peer_id) {
+                            Ok(handshake_msg) => {
+                                debug_println!("[HANDSHAKE] Initiated handshake with {}, sending {} bytes", target_peer_id, handshake_msg.len());
                                 
-                                // Sign the encrypted payload
-                                let signature = noise_service.sign(&encrypted);
-                                
-                                // Create packet with recipient ID for private routing
-                                let packet = create_bitchat_packet_with_recipient_and_signature(
+                                // Create packet for handshake message
+                                let packet = create_bitchat_packet_with_recipient(
                                     &my_peer_id,
-                                    target_peer_id,  // Specify the recipient
-                                    MessageType::Message,
-                                    encrypted,
-                                    Some(signature)
+                                    Some(target_peer_id),
+                                    MessageType::NoiseHandshake,
+                                    handshake_msg,
+                                    None
                                 );
                                 
-                                // Send the private message
+                                // Send handshake message
                                 if let Err(_e) = send_packet_with_fragmentation(&peripheral, cmd_char, packet, &my_peer_id).await {
-                                    println!("\n\x1b[91m❌ Failed to send private message\x1b[0m");
-                                    println!("\x1b[90mThe message could not be delivered. Connection may have been lost.\x1b[0m");
+                                    println!("\x1b[91m❌ Failed to send handshake\x1b[0m");
                                 } else {
-                                    // Show the message was sent in a cleaner format
-                                    let timestamp = chrono::Local::now();
-                                    let display = format_message_display(
-                                        timestamp,
-                                        &nickname,  // sender
-                                        &line,
-                                        true, // is_private
-                                        false, // is_channel
-                                        None, // channel_name
-                                        Some(target_nickname), // recipient
-                                        &nickname, // my_nickname
-                                    );
-                                    // Move cursor up to overwrite the input line, clear it, print message
-                                    print!("\x1b[1A\r\x1b[K{}\n", display);
-                                    std::io::stdout().flush().unwrap();
+                                    println!("» Handshake initiated. Please wait for response and try sending the message again.");
                                 }
                             },
                             Err(e) => {
-                                println!("[!] Failed to encrypt private message: {:?}", e);
-                                println!("[!] Make sure you have received key exchange from {}", target_nickname);
+                                println!("[!] Failed to initiate handshake: {:?}", e);
+                                println!("[!] Unable to establish secure connection with {}", target_nickname);
                             }
                         }
                     }
