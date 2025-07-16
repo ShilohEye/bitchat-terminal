@@ -28,10 +28,7 @@ cdk-sqlite = "0.11"
 anyhow = "1.0"
 bip39 = "2.0"
 url = "2.0"
-tracing = "0.1"
 home = "0.5"
-clap = { version = "4.0", features = ["derive"] }
-shlex = "1.1"
 
 # For Cryptography
 x25519-dalek = { version = "2.0", features = ["static_secrets", "getrandom"] }

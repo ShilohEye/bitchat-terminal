@@ -1654,7 +1654,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             ""
                         };
                         
-                        if let Err(e) = wallet.handle_command(command, send_message_fn).await {
+                        let mut claimable_tokens = terminal_ux::ClaimableTokenManager::new();
+                        if let Err(e) = wallet.handle_command(command, send_message_fn, &mut claimable_tokens).await {
                             eprintln!("Cashu command error: {}", e);
                         }
                     } else {

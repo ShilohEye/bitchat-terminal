@@ -2,11 +2,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use bip39::rand::{thread_rng, Rng};
+use bip39::rand::thread_rng;
 use bip39::Mnemonic;
 use cdk::cdk_database;
 use cdk::cdk_database::WalletDatabase;
@@ -22,286 +20,15 @@ use cdk::wallet::WalletSubscription;
 use cdk_sqlite::WalletSqliteDatabase;
 use cdk::nuts::Token;
 
+// Import the token management and printing functions from terminal_ux
+use crate::terminal_ux::{print_ascii_token, print_token_claimed, print_active_tokens, ClaimableTokenManager};
+
 const DEFAULT_CASHU_DIR: &str = ".bitchat";
-
-#[derive(Debug, Clone)]
-pub struct ClaimableToken {
-    pub id: String,
-    pub token: String,
-    pub amount: u64,
-    pub unit: String,
-    pub mint_url: String,
-    pub created_at: u64,
-    pub expires_at: u64,
-}
-
-#[derive(Debug)]
-pub struct ClaimableTokenManager {
-    tokens: HashMap<String, ClaimableToken>,
-}
-
-impl ClaimableTokenManager {
-    pub fn new() -> Self {
-        Self {
-            tokens: HashMap::new(),
-        }
-    }
-
-    pub fn generate_token_id() -> String {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
-        format!("{:04}", rng.gen_range(1000..10000))
-    }
-
-    pub fn add_token(&mut self, token: String, amount: u64, unit: String, mint_url: String) -> String {
-        let id = Self::generate_token_id();
-        let current_time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        
-        let claimable = ClaimableToken {
-            id: id.clone(),
-            token,
-            amount,
-            unit,
-            mint_url,
-            created_at: current_time,
-            expires_at: current_time + 3600, // 1 hour expiry
-        };
-
-        self.tokens.insert(id.clone(), claimable);
-        id
-    }
-
-    pub fn claim_token(&mut self, id: &str) -> Option<String> {
-        let current_time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        if let Some(claimable) = self.tokens.get(id) {
-            if current_time > claimable.expires_at {
-                self.tokens.remove(id);
-                return None; // Token expired
-            }
-            
-            let token = claimable.token.clone();
-            self.tokens.remove(id);
-            Some(token)
-        } else {
-            None
-        }
-    }
-
-    pub fn cleanup_expired(&mut self) {
-        let current_time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        self.tokens.retain(|_, token| current_time <= token.expires_at);
-    }
-
-    pub fn list_active_tokens(&self) -> Vec<(String, &ClaimableToken)> {
-        let current_time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        self.tokens
-            .iter()
-            .filter(|(_, token)| current_time <= token.expires_at)
-            .map(|(id, token)| (id.clone(), token))
-            .collect()
-    }
-}
-
-pub fn print_ascii_token(id: &str, amount: u64, unit: &str, mint_url: &str) {
-    println!("\n\x1b[33m╔═══════════════════════════════════════╗\x1b[0m");
-    println!("\x1b[33m║\x1b[0m           \x1b[36m💰 CASHU TOKEN DROP\x1b[0m           \x1b[33m║\x1b[0m");
-    println!("\x1b[33m╠═══════════════════════════════════════╣\x1b[0m");
-    println!("\x1b[33m║\x1b[0m                                       \x1b[33m║\x1b[0m");
-    println!("\x1b[33m║\x1b[0m    \x1b[32m┌─────────────────────────────┐\x1b[0m    \x1b[33m║\x1b[0m");
-    
-    // Format token ID with proper padding
-    let token_line = format!("     TOKEN ID: {}     ", id);
-    let padding = if token_line.len() < 29 {
-        " ".repeat((29 - token_line.len()) / 2)
-    } else {
-        "".to_string()
-    };
-    let right_padding = if token_line.len() < 29 {
-        " ".repeat(29 - token_line.len() - padding.len())
-    } else {
-        "".to_string()
-    };
-    
-    println!("\x1b[33m║\x1b[0m    \x1b[32m│\x1b[0m{}\x1b[93m{}\x1b[0m{}\x1b[32m│\x1b[0m    \x1b[33m║\x1b[0m", padding, token_line.trim(), right_padding);
-    println!("\x1b[33m║\x1b[0m    \x1b[32m└─────────────────────────────┘\x1b[0m    \x1b[33m║\x1b[0m");
-    println!("\x1b[33m║\x1b[0m                                       \x1b[33m║\x1b[0m");
-    
-    // Format amount with proper padding
-    let amount_line = format!("Amount: {} {}", amount, unit);
-    let amount_padding = if amount_line.len() < 37 {
-        " ".repeat((37 - amount_line.len()) / 2)
-    } else {
-        "".to_string()
-    };
-    let amount_right_padding = if amount_line.len() < 37 {
-        " ".repeat(37 - amount_line.len() - amount_padding.len())
-    } else {
-        "".to_string()
-    };
-    
-    println!("\x1b[33m║\x1b[0m{}\x1b[92m{}\x1b[0m{}\x1b[33m║\x1b[0m", amount_padding, amount_line, amount_right_padding);
-    
-    // Truncate mint URL if too long and format with proper padding
-    let display_mint = if mint_url.len() > 30 {
-        format!("{}...", &mint_url[..27])
-    } else {
-        mint_url.to_string()
-    };
-    let mint_line = format!("Mint: {}", display_mint);
-    let mint_padding = if mint_line.len() < 37 {
-        " ".repeat((37 - mint_line.len()) / 2)
-    } else {
-        "".to_string()
-    };
-    let mint_right_padding = if mint_line.len() < 37 {
-        " ".repeat(37 - mint_line.len() - mint_padding.len())
-    } else {
-        "".to_string()
-    };
-    
-    println!("\x1b[33m║\x1b[0m{}\x1b[90m{}\x1b[0m{}\x1b[33m║\x1b[0m", mint_padding, mint_line, mint_right_padding);
-    
-    println!("\x1b[33m║\x1b[0m                                       \x1b[33m║\x1b[0m");
-    
-    // Format claim instruction with proper padding
-    let claim_line = format!("Type: /wallet claim {} to claim!", id);
-    let claim_padding = if claim_line.len() < 37 {
-        " ".repeat((37 - claim_line.len()) / 2)
-    } else {
-        "".to_string()
-    };
-    let claim_right_padding = if claim_line.len() < 37 {
-        " ".repeat(37 - claim_line.len() - claim_padding.len())
-    } else {
-        "".to_string()
-    };
-    
-    println!("\x1b[33m║\x1b[0m{}\x1b[96m{}\x1b[0m{}\x1b[33m║\x1b[0m", claim_padding, claim_line, claim_right_padding);
-    println!("\x1b[33m║\x1b[0m                                       \x1b[33m║\x1b[0m");
-    println!("\x1b[33m║\x1b[0m           \x1b[91m⏰ Expires in 1 hour\x1b[0m          \x1b[33m║\x1b[0m");
-    println!("\x1b[33m╚═══════════════════════════════════════╝\x1b[0m\n");
-}
-
-pub fn print_token_claimed(id: &str, amount: u64, unit: &str) {
-    println!("\n\x1b[32m╔═══════════════════════════════════════╗\x1b[0m");
-    println!("\x1b[32m║\x1b[0m           \x1b[93m🎉 TOKEN CLAIMED!\x1b[0m            \x1b[32m║\x1b[0m");
-    println!("\x1b[32m╠═══════════════════════════════════════╣\x1b[0m");
-    println!("\x1b[32m║\x1b[0m                                       \x1b[32m║\x1b[0m");
-    println!("\x1b[32m║\x1b[0m      You successfully claimed:         \x1b[32m║\x1b[0m");
-    println!("\x1b[32m║\x1b[0m                                       \x1b[32m║\x1b[0m");
-    
-    // Format token ID with proper padding
-    let token_id_line = format!("Token ID: {}", id);
-    let token_id_padding = if token_id_line.len() < 37 {
-        " ".repeat((37 - token_id_line.len()) / 2)
-    } else {
-        "".to_string()
-    };
-    let token_id_right_padding = if token_id_line.len() < 37 {
-        " ".repeat(37 - token_id_line.len() - token_id_padding.len())
-    } else {
-        "".to_string()
-    };
-    
-    println!("\x1b[32m║\x1b[0m{}\x1b[93m{}\x1b[0m{}\x1b[32m║\x1b[0m", token_id_padding, token_id_line, token_id_right_padding);
-    
-    // Format amount with proper padding
-    let amount_line = format!("Amount: {} {}", amount, unit);
-    let amount_padding = if amount_line.len() < 37 {
-        " ".repeat((37 - amount_line.len()) / 2)
-    } else {
-        "".to_string()
-    };
-    let amount_right_padding = if amount_line.len() < 37 {
-        " ".repeat(37 - amount_line.len() - amount_padding.len())
-    } else {
-        "".to_string()
-    };
-    
-    println!("\x1b[32m║\x1b[0m{}\x1b[92m{}\x1b[0m{}\x1b[32m║\x1b[0m", amount_padding, amount_line, amount_right_padding);
-    println!("\x1b[32m║\x1b[0m                                       \x1b[32m║\x1b[0m");
-    println!("\x1b[32m║\x1b[0m    The token has been added to your    \x1b[32m║\x1b[0m");
-    println!("\x1b[32m║\x1b[0m           Cashu wallet! 💰             \x1b[32m║\x1b[0m");
-    println!("\x1b[32m╚═══════════════════════════════════════╝\x1b[0m\n");
-}
-
-pub fn print_active_tokens(tokens: &[(String, &ClaimableToken)]) {
-    if tokens.is_empty() {
-        println!("\n\x1b[90m╔═══════════════════════════════════════╗\x1b[0m");
-        println!("\x1b[90m║\x1b[0m         \x1b[36m💰 CLAIMABLE TOKENS\x1b[0m          \x1b[90m║\x1b[0m");
-        println!("\x1b[90m╠═══════════════════════════════════════╣\x1b[0m");
-        println!("\x1b[90m║\x1b[0m                                       \x1b[90m║\x1b[0m");
-        println!("\x1b[90m║\x1b[0m        No tokens available to         \x1b[90m║\x1b[0m");
-        println!("\x1b[90m║\x1b[0m             claim right now           \x1b[90m║\x1b[0m");
-        println!("\x1b[90m║\x1b[0m                                       \x1b[90m║\x1b[0m");
-        println!("\x1b[90m╚═══════════════════════════════════════╝\x1b[0m\n");
-        return;
-    }
-
-    println!("\n\x1b[33m╔═══════════════════════════════════════╗\x1b[0m");
-    println!("\x1b[33m║\x1b[0m         \x1b[36m💰 CLAIMABLE TOKENS\x1b[0m          \x1b[33m║\x1b[0m");
-    println!("\x1b[33m╠═══════════════════════════════════════╣\x1b[0m");
-    
-    for (id, token) in tokens {
-        let current_time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let time_left = if token.expires_at > current_time {
-            let mins_left = (token.expires_at - current_time) / 60;
-            if mins_left > 60 {
-                format!("{}h {}m", mins_left / 60, mins_left % 60)
-            } else {
-                format!("{}m", mins_left)
-            }
-        } else {
-            "Expired".to_string()
-        };
-
-        println!("\x1b[33m║\x1b[0m                                       \x1b[33m║\x1b[0m");
-        
-        // Format token line with proper spacing
-        let token_info = format!("ID: {}  {} {}  ({})", id, token.amount, token.unit, time_left);
-        let token_padding = if token_info.len() < 37 {
-            " ".repeat((37 - token_info.len()) / 2)
-        } else {
-            "".to_string()
-        };
-        let token_right_padding = if token_info.len() < 37 {
-            " ".repeat(37 - token_info.len() - token_padding.len())
-        } else {
-            "".to_string()
-        };
-        
-        println!("\x1b[33m║\x1b[0m{}\x1b[93mID: {}\x1b[0m  \x1b[92m{} {}\x1b[0m  \x1b[91m({})\x1b[0m{}\x1b[33m║\x1b[0m", 
-            token_padding, id, token.amount, token.unit, time_left, token_right_padding);
-    }
-    
-    println!("\x1b[33m║\x1b[0m                                       \x1b[33m║\x1b[0m");
-    println!("\x1b[33m║\x1b[0m      \x1b[96mUse /wallet claim <ID>\x1b[0m        \x1b[33m║\x1b[0m");
-    println!("\x1b[33m╚═══════════════════════════════════════╝\x1b[0m\n");
-}
 
 pub struct CashuWallet {
     multi_mint_wallet: MultiMintWallet,
     work_dir: PathBuf,
     active_mint: Option<MintUrl>,
-    claimable_tokens: ClaimableTokenManager,
 }
 
 impl CashuWallet {
@@ -325,8 +52,10 @@ impl CashuWallet {
                 Mnemonic::from_str(&contents)?
             }
             Err(_) => {
+                use rand::RngCore;
                 let mut rng = thread_rng();
-                let random_bytes: [u8; 32] = rng.gen();
+                let mut random_bytes: [u8; 32] = [0; 32];
+                rng.fill_bytes(&mut random_bytes);
                 let mnemonic = Mnemonic::from_entropy(&random_bytes)?;
                 fs::write(seed_path, mnemonic.to_string())?;
                 mnemonic
@@ -385,11 +114,10 @@ impl CashuWallet {
             multi_mint_wallet,
             work_dir,
             active_mint,
-            claimable_tokens: ClaimableTokenManager::new(),
         })
     }
 
-    pub async fn handle_command<F>(&mut self, command: &str, send_message_fn: F) -> Result<()> 
+    pub async fn handle_command<F>(&mut self, command: &str, send_message_fn: F, claimable_tokens: &mut ClaimableTokenManager) -> Result<()> 
     where
         F: Fn(&str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Box<dyn std::error::Error>>> + Send>> + Send + Sync,
     {
@@ -431,7 +159,7 @@ impl CashuWallet {
                 match self.create_claimable_token(amount, mint_url, &unit).await {
                     Ok((token, amount, unit, mint_url)) => {
                         // Add to claimable tokens manager
-                        let token_id = self.claimable_tokens.add_token(
+                        let token_id = claimable_tokens.add_token(
                             format!("cashu:{}", token),
                             amount,
                             unit.clone(),
@@ -506,9 +234,9 @@ impl CashuWallet {
                 }
                 
                 let token_id = parts[1];
-                self.claimable_tokens.cleanup_expired();
+                claimable_tokens.cleanup_expired();
                 
-                if let Some(token_str) = self.claimable_tokens.claim_token(token_id) {
+                if let Some(token_str) = claimable_tokens.claim_token(token_id) {
                     // Remove cashu: prefix if present for wallet processing
                     let clean_token = if token_str.starts_with("cashu:") {
                         &token_str[6..]
@@ -530,8 +258,8 @@ impl CashuWallet {
                 Ok(())
             }
             "tokens" => {
-                self.claimable_tokens.cleanup_expired();
-                let active_tokens = self.claimable_tokens.list_active_tokens();
+                claimable_tokens.cleanup_expired();
+                let active_tokens = claimable_tokens.list_active_tokens();
                 print_active_tokens(&active_tokens);
                 Ok(())
             }
@@ -546,6 +274,7 @@ impl CashuWallet {
             }
         }
     }
+    
     async fn get_available_wallet(&self, unit: CurrencyUnit) -> Result<Wallet> {
         let balances = self.multi_mint_wallet.get_balances(&unit).await?;
         
@@ -874,7 +603,6 @@ impl CashuWallet {
     pub async fn show_seed(&self) -> Result<()> {
         let seed_path = self.work_dir.join("seed");
         let mnemonic = fs::read_to_string(seed_path)?;
-        let seed = Mnemonic::from_str(&mnemonic)?;
 
         println!("\n\x1b[38;5;46m━━━ Your Cashu Seed ━━━\x1b[0m\n");
         println!("Your Cashu seed is your private key. Do not share it with anyone!");
@@ -882,9 +610,6 @@ impl CashuWallet {
         println!("Please back it up and store it securely.");
         println!("\nYour Seed (Mnemonic):");
         println!("{}", mnemonic);
-        println!("\nYour Seed (Hex):");
-        println!("{}", seed.words().collect::<Vec<_>>().join(" "));
-        println!("\n\x1b[90mExample: /wallet restore <your_seed_hex>\x1b[0m");
         Ok(())
     }
 
