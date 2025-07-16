@@ -24,8 +24,11 @@ fi
 
 echo "🔧 Building test container and running tests..."
 
+# Get git hash for build
+GIT_HASH=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+
 # Build and run using the optimized test Dockerfile
-docker build -f Dockerfile.test -t bitchat-test "$CURRENT_DIR"
+docker build -f Dockerfile.test --build-arg GIT_HASH="$GIT_HASH" -t bitchat-test "$CURRENT_DIR"
 docker run --rm bitchat-test cargo test $TEST_FILTER
 
 echo "✅ Tests completed successfully!"

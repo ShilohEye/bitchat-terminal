@@ -1,6 +1,9 @@
 # Dockerfile optimized for testing with better dependency caching
 FROM rust:1.85-bookworm
 
+# Accept git hash as build argument
+ARG GIT_HASH=unknown
+
 # Install build dependencies for Bluetooth Low Energy support
 RUN apt-get update && apt-get install -y \
     pkg-config \
@@ -24,8 +27,9 @@ RUN cargo build && rm -rf src/
 # Copy the actual source code
 COPY src/ ./src/
 
-# Build the actual application (only this layer rebuilds when code changes)
-RUN cargo build
+# Build the actual application with git hash (only this layer rebuilds when code changes)
+RUN echo "Building with git hash: $GIT_HASH" && \
+    GIT_HASH=$GIT_HASH cargo build
 
 # Set environment for testing
 ENV RUST_LOG=debug

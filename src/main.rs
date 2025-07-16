@@ -32,7 +32,7 @@ use bloomfilter::Bloom;
 // use rand::rngs::OsRng; // Removed: unused
 use rand::Rng;
 use sha2::{Sha256, Digest};
-use serde::{Serialize, Deserialize};
+use serde::{Serialize, Deserialize, Deserializer};
 use serde_json;
 
 // Debug levels
@@ -175,6 +175,7 @@ struct BitchatMessage {
     channel: Option<String>,
     is_encrypted: bool,
     encrypted_content: Option<Vec<u8>>,  // Store raw encrypted bytes
+    timestamp: u64,  // Milliseconds since epoch
 }
 
 // Delivery confirmation structures matching iOS
@@ -245,17 +246,38 @@ struct VersionAck {
     reason: Option<String>,
 }
 
+// Custom deserializer for base64-encoded byte arrays
+fn deserialize_base64<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use base64::{Engine as _, engine::general_purpose};
+    use serde::de::Error;
+    let s = String::deserialize(deserializer)?;
+    general_purpose::STANDARD.decode(&s).map_err(Error::custom)
+}
+
+// Custom serializer for byte arrays to base64
+fn serialize_base64<S>(bytes: &Vec<u8>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use base64::{Engine as _, engine::general_purpose};
+    serializer.serialize_str(&general_purpose::STANDARD.encode(bytes))
+}
+
 // Noise identity announcement structure
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct NoiseIdentityAnnouncement {
     #[serde(rename = "peerID")]
     peer_id: String,
-    #[serde(rename = "publicKey")]
+    #[serde(rename = "publicKey", deserialize_with = "deserialize_base64", serialize_with = "serialize_base64")]
     public_key: Vec<u8>,
     nickname: String,
-    timestamp: u64,
+    timestamp: f64,
     #[serde(rename = "previousPeerID")]
     previous_peer_id: Option<String>,
+    #[serde(deserialize_with = "deserialize_base64", serialize_with = "serialize_base64")]
     signature: Vec<u8>,
 }
 
@@ -287,7 +309,7 @@ struct ChannelPasswordUpdate {
     owner_id: String,
     #[serde(rename = "ownerFingerprint")]
     owner_fingerprint: String,
-    #[serde(rename = "encryptedPassword")]
+    #[serde(rename = "encryptedPassword", deserialize_with = "deserialize_base64", serialize_with = "serialize_base64")]
     encrypted_password: Vec<u8>,
     #[serde(rename = "newKeyCommitment")]
     new_key_commitment: String,
@@ -477,7 +499,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("\\_______/ \\__|   \\____/  \\_______|\\__|  \\__| \\_______|  \\____/\x1b[0m");
         println!("\n\x1b[38;5;40m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\x1b[0m");
         println!("\x1b[37mDecentralized • Encrypted • Peer-to-Peer • Open Source\x1b[0m");
-        println!("\x1b[37m                bitch@ the terminal {}\x1b[0m", VERSION);
+        // Get git commit hash at build time
+        let git_hash = option_env!("GIT_HASH").unwrap_or("unknown");
+        println!("\x1b[37m                bitch@ the terminal {} ({})\x1b[0m", VERSION, git_hash);
         println!("\x1b[38;5;40m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\x1b[0m\n");
 
         loop {
@@ -604,7 +628,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         peer_id: my_peer_id.clone(),
         public_key: static_public_key.clone(),
         nickname: nickname.clone(),
-        timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+        timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64(),
         previous_peer_id: None,
         signature: vec![], // We'll add proper signature later if needed
     };
@@ -3213,6 +3237,9 @@ fn parse_bitchat_message_payload(data: &[u8]) -> Result<BitchatMessage, &'static
 
     if data.len() < offset + 8 { return Err("Payload too short for timestamp"); }
 
+    let timestamp_bytes: [u8; 8] = data[offset..offset+8].try_into().map_err(|_| "Failed to read timestamp")?;
+    let timestamp = u64::from_be_bytes(timestamp_bytes);
+    debug_full_println!("[PARSE] Timestamp: {} ms", timestamp);
     offset += 8;
 
     if data.len() < offset + 1 { return Err("Payload too short for ID length"); }
@@ -3316,7 +3343,7 @@ fn parse_bitchat_message_payload(data: &[u8]) -> Result<BitchatMessage, &'static
 
     }
 
-    Ok(BitchatMessage { id, content, channel, is_encrypted, encrypted_content })
+    Ok(BitchatMessage { id, content, channel, is_encrypted, encrypted_content, timestamp })
 
 }
 
@@ -4100,7 +4127,7 @@ mod tests {
             peer_id: "test_peer".to_string(),
             public_key: vec![1, 2, 3, 4],
             nickname: "TestUser".to_string(),
-            timestamp: 1234567890,
+            timestamp: 1234567890.0,
             previous_peer_id: Some("old_peer".to_string()),
             signature: vec![5, 6, 7, 8],
         };

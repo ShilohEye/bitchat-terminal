@@ -31,3 +31,4 @@ aes-gcm = { version = "0.10", features = ["aes"] }
 
 # Noise Protocol with snow crate  
 snow = "0.9.6"
+base64 = "0.22.1"

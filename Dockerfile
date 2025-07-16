@@ -1,6 +1,9 @@
 # Multi-stage build for bitchat-terminal
 FROM rust:1.85-bookworm as builder
 
+# Accept git hash as build argument
+ARG GIT_HASH=unknown
+
 # Install build dependencies for Bluetooth Low Energy support
 RUN apt-get update && apt-get install -y \
     pkg-config \
@@ -16,8 +19,9 @@ WORKDIR /app
 COPY Cargo.toml ./
 COPY src/ ./src/
 
-# Build the application in release mode
-RUN cargo build --release
+# Build with git hash as environment variable
+RUN echo "Building with git hash: $GIT_HASH" && \
+    GIT_HASH=$GIT_HASH cargo build --release
 
 # Runtime stage with minimal dependencies
 FROM debian:bookworm-slim
