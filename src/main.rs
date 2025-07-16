@@ -73,12 +73,14 @@ mod fragmentation;
 mod encryption;
 mod terminal_ux;
 mod persistence;
+mod cashu_wallet;
 
 use compression::decompress;
 use fragmentation::{Fragment, FragmentType};
 use encryption::EncryptionService;
 use terminal_ux::{ChatContext, ChatMode, format_message_display, print_help};
 use persistence::{AppState, load_state, save_state, encrypt_password, decrypt_password};
+use cashu_wallet::CashuWallet;
 
 // --- Constants ---
 
@@ -300,7 +302,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let mut stdin = BufReader::new(io::stdin()).lines();
 
-        // Display ASCII art logo in Matrix green
+        // Enhanced ASCII art logo with command guide
         println!("\n\x1b[38;5;46m##\\       ##\\   ##\\               ##\\                  ##\\");
         println!("## |      \\__|  ## |              ## |                 ## |");
         println!("#######\\  ##\\ ######\\    #######\\ #######\\   ######\\ ######\\");
@@ -309,10 +311,65 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("## |  ## |## |  ## |##\\ ## |      ## |  ## |##  __## | ## |##\\");
         println!("#######  |## |  \\####  |\\#######\\ ## |  ## |\\####### | \\####  |");
         println!("\\_______/ \\__|   \\____/  \\_______|\\__|  \\__| \\_______|  \\____/\x1b[0m");
+        
         println!("\n\x1b[38;5;40m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\x1b[0m");
         println!("\x1b[37mDecentralized • Encrypted • Peer-to-Peer • Open Source\x1b[0m");
-        println!("\x1b[37m                bitch@ the terminal {}\x1b[0m", VERSION);
-        println!("\x1b[38;5;40m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\x1b[0m\n");
+        println!("\x1b[37m                bitchat@ the terminal {}\x1b[0m", VERSION);
+        println!("\x1b[38;5;40m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\x1b[0m");
+        
+        // Quick Start Guide
+        println!("\n\x1b[38;5;228m📖 QUICK START GUIDE\x1b[0m");
+        println!("\x1b[90m┌─────────────────────────────────────────────────────────────┐\x1b[0m");
+        println!("\x1b[90m│\x1b[0m \x1b[38;5;159mBasic Commands\x1b[0m                                             \x1b[90m│\x1b[0m");
+        println!("\x1b[90m│\x1b[0m   \x1b[92m/help\x1b[0m             Show detailed help                     \x1b[90m│\x1b[0m");
+        println!("\x1b[90m│\x1b[0m   \x1b[92m/status\x1b[0m           Show connection info                    \x1b[90m│\x1b[0m");
+        println!("\x1b[90m│\x1b[0m   \x1b[92m/name <nick>\x1b[0m      Change your nickname                     \x1b[90m│\x1b[0m");
+        println!("\x1b[90m│\x1b[0m   \x1b[92m/exit\x1b[0m             Quit BitChat                           \x1b[90m│\x1b[0m");
+        println!("\x1b[90m├─────────────────────────────────────────────────────────────┤\x1b[0m");
+        println!("\x1b[90m│\x1b[0m \x1b[38;5;159mChat & Messaging\x1b[0m                                         \x1b[90m│\x1b[0m");
+        println!("\x1b[90m│\x1b[0m   \x1b[92m/online\x1b[0m or \x1b[92m/w\x1b[0m     Show who's online                      \x1b[90m│\x1b[0m");
+        println!("\x1b[90m│\x1b[0m   \x1b[92m/dm <nick> [msg]\x1b[0m  Send private message                     \x1b[90m│\x1b[0m");
+        println!("\x1b[90m│\x1b[0m   \x1b[92m/reply\x1b[0m            Reply to last private message            \x1b[90m│\x1b[0m");
+        println!("\x1b[90m│\x1b[0m   \x1b[92m/public\x1b[0m           Switch to public chat                    \x1b[90m│\x1b[0m");
+        println!("\x1b[90m│\x1b[0m   \x1b[92m/clear\x1b[0m            Clear screen                             \x1b[90m│\x1b[0m");
+        println!("\x1b[90m├─────────────────────────────────────────────────────────────┤\x1b[0m");
+        println!("\x1b[90m│\x1b[0m \x1b[38;5;159mChannels\x1b[0m                                                 \x1b[90m│\x1b[0m");
+        println!("\x1b[90m│\x1b[0m   \x1b[92m/j #channel\x1b[0m       Join a channel                          \x1b[90m│\x1b[0m");
+        println!("\x1b[90m│\x1b[0m   \x1b[92m/j #channel pass\x1b[0m   Join password-protected channel          \x1b[90m│\x1b[0m");
+        println!("\x1b[90m│\x1b[0m   \x1b[92m/channels\x1b[0m         List discovered channels                 \x1b[90m│\x1b[0m");
+        println!("\x1b[90m│\x1b[0m   \x1b[92m/pass <password>\x1b[0m  Set channel password (owner only)        \x1b[90m│\x1b[0m");
+        println!("\x1b[90m│\x1b[0m   \x1b[92m/transfer @user\x1b[0m   Transfer channel ownership (owner only)  \x1b[90m│\x1b[0m");
+        println!("\x1b[90m│\x1b[0m   \x1b[92m/leave\x1b[0m            Leave current channel                    \x1b[90m│\x1b[0m");
+        println!("\x1b[90m├─────────────────────────────────────────────────────────────┤\x1b[0m");
+        println!("\x1b[90m│\x1b[0m \x1b[38;5;159mNavigation\x1b[0m                                               \x1b[90m│\x1b[0m");
+        println!("\x1b[90m│\x1b[0m   \x1b[92m/list\x1b[0m             Show numbered conversation list         \x1b[90m│\x1b[0m");
+        println!("\x1b[90m│\x1b[0m   \x1b[92m/switch\x1b[0m           Interactive conversation switcher       \x1b[90m│\x1b[0m");
+        println!("\x1b[90m│\x1b[0m   \x1b[92m<number>\x1b[0m          Quick switch to conversation            \x1b[90m│\x1b[0m");
+        println!("\x1b[90m├─────────────────────────────────────────────────────────────┤\x1b[0m");
+        println!("\x1b[90m│\x1b[0m \x1b[38;5;159mUser Management\x1b[0m                                          \x1b[90m│\x1b[0m");
+        println!("\x1b[90m│\x1b[0m   \x1b[92m/block\x1b[0m            List blocked users                       \x1b[90m│\x1b[0m");
+        println!("\x1b[90m│\x1b[0m   \x1b[92m/block @user\x1b[0m      Block a user                            \x1b[90m│\x1b[0m");
+        println!("\x1b[90m│\x1b[0m   \x1b[92m/unblock @user\x1b[0m    Unblock a user                          \x1b[90m│\x1b[0m");
+        println!("\x1b[90m├─────────────────────────────────────────────────────────────┤\x1b[0m");
+        println!("\x1b[90m│\x1b[0m \x1b[38;5;159mCashu Wallet Commands\x1b[0m                                    \x1b[90m│\x1b[0m");
+        println!("\x1b[90m│\x1b[0m   \x1b[92m/wallet\x1b[0m           Show wallet status & balance             \x1b[90m│\x1b[0m");
+        println!("\x1b[90m│\x1b[0m   \x1b[92m/wallet receive\x1b[0m   Generate invoice to receive ecash        \x1b[90m│\x1b[0m");
+        println!("\x1b[90m│\x1b[0m   \x1b[92m/wallet send\x1b[0m      Send ecash tokens                       \x1b[90m│\x1b[0m");
+        println!("\x1b[90m│\x1b[0m   \x1b[92m/wallet history\x1b[0m   Show transaction history                 \x1b[90m│\x1b[0m");
+        println!("\x1b[90m│\x1b[0m   \x1b[92m/wallet mint\x1b[0m      Mint new tokens from Lightning          \x1b[90m│\x1b[0m");
+        println!("\x1b[90m│\x1b[0m   \x1b[92m/wallet melt\x1b[0m      Redeem tokens for Lightning payment     \x1b[90m│\x1b[0m");
+        println!("\x1b[90m│\x1b[0m   \x1b[92m/pay <amount>\x1b[0m     Quick payment to current conversation    \x1b[90m│\x1b[0m");
+        println!("\x1b[90m│\x1b[0m   \x1b[92m/pay @user <amt>\x1b[0m   Send payment to specific user            \x1b[90m│\x1b[0m");
+        println!("\x1b[90m└─────────────────────────────────────────────────────────────┘\x1b[0m");
+        
+        println!("\n\x1b[38;5;226m💡 Pro Tips:\x1b[0m");
+        println!("   • Just type to send messages to your current conversation");
+        println!("   • Use numbers (1-9) to quickly switch between conversations");
+        println!("   • Private messages are end-to-end encrypted automatically");
+        println!("   • All ecash transactions are private and instant");
+        println!("   • Your data is stored locally and synced via Bluetooth mesh");
+        
+        println!("\n\x1b[38;5;40m» Initializing connection...\x1b[0m\n");
 
         loop {
             // Note: We can't access chat_context here directly, but we'll improve this later
@@ -442,6 +499,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut chat_context = ChatContext::new();
     let mut channel_keys: HashMap<String, [u8; 32]> = HashMap::new();
     let mut _chat_messages: HashMap<String, Vec<String>> = HashMap::new();  // for /clear command - stores messages by context
+
     
     // Already loaded app_state above for nickname
     let mut blocked_peers = app_state.blocked_peers;
@@ -466,6 +524,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     // Note: We don't restore joined_channels as they need to be re-joined via announce
+    
+    // Initialize Cashu wallet
+    let mut cashu_wallet = match CashuWallet::new().await {
+        Ok(wallet) => Some(wallet),
+        Err(e) => {
+            debug_println!("[CASHU] Failed to initialize wallet: {}", e);
+            None
+        }
+    };
     
     // Helper to create AppState for saving
     let create_app_state = |blocked: &HashSet<String>, 
@@ -1539,7 +1606,65 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     continue;
                 }
-                
+
+
+                // Handle all wallet-related commands
+                if line.starts_with("/wallet") || line.starts_with("/pay") {
+                    if let Some(wallet) = &mut cashu_wallet {
+                        // Create a closure that captures the send_message context
+                        let send_message_fn = |message: &str| -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Box<dyn std::error::Error>>> + Send>> {
+                            let message = message.to_string();
+                            let nickname = nickname.clone();
+                            let my_peer_id = my_peer_id.clone();
+                            let chat_context = chat_context.clone();
+                            let channel_keys = channel_keys.clone();
+                            let password_protected_channels = password_protected_channels.clone();
+                            let encryption_service = encryption_service.clone();
+                            let peripheral = peripheral.clone();
+                            let cmd_char = cmd_char.clone();
+                            
+                            Box::pin(async move {
+                                // We need to create a temporary delivery tracker since we can't capture the mutable reference
+                                let mut temp_delivery_tracker = DeliveryTracker::new();
+                                
+                                match send_message(
+                                    &message,
+                                    &nickname,
+                                    &my_peer_id,
+                                    &chat_context,
+                                    &channel_keys,
+                                    &password_protected_channels,
+                                    &encryption_service,
+                                    &mut temp_delivery_tracker,
+                                    &peripheral,
+                                    &cmd_char,
+                                ).await {
+                                    Ok(_) => Ok(()),
+                                    Err(e) => Err(e),
+                                }
+                            })
+                        };
+                        
+                        // Determine the command to pass to the wallet
+                        let command = if line.starts_with("/wallet") {
+                            line.strip_prefix("/wallet").unwrap_or("")
+                        } else if line.starts_with("/pay") {
+                            line.strip_prefix("/pay").unwrap_or("")
+                        } else {
+                            ""
+                        };
+                        
+                        if let Err(e) = wallet.handle_command(command, send_message_fn).await {
+                            eprintln!("Cashu command error: {}", e);
+                        }
+                    } else {
+                        println!("\x1b[93m⚠ Cashu wallet not available\x1b[0m");
+                        println!("\x1b[90mWallet initialization failed at startup.\x1b[0m");
+                    }
+                    continue;
+                }
+
+
                 // Check for unknown commands
                 if line.starts_with("/") {
                     println!("\x1b[93m⚠ Unknown command: {}\x1b[0m", line.split_whitespace().next().unwrap_or(""));
@@ -1547,174 +1672,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
                 
-                // Check if in DM mode first
-                if let ChatMode::PrivateDM { nickname: target_nickname, peer_id: target_peer_id } = &chat_context.current_mode {
-                    // Only show echo in debug mode
-                    debug_println!("{} > {}", chat_context.format_prompt(), line);
-                    debug_println!("[PRIVATE] Sending DM to {} (peer_id: {})", target_nickname, target_peer_id);
-                    
-                    // Create message payload with private flag
-                    let (message_payload, message_id) = create_bitchat_message_payload_full(&nickname, &line, None, true, &my_peer_id);
-                    
-                    // Track private message for delivery confirmation
-                    delivery_tracker.track_message(message_id.clone(), line.clone(), true);
-                    
-                    // Pad the message for privacy using PKCS#7
-                    let block_sizes = [256, 512, 1024, 2048];
-                    let payload_size = message_payload.len();
-                    let target_size = block_sizes.iter()
-                        .find(|&&size| payload_size + 16 <= size)
-                        .copied()
-                        .unwrap_or(payload_size);
-                    
-                    let padding_needed = target_size - message_payload.len();
-                    let mut padded_payload = message_payload.clone();
-                    
-                    if padding_needed > 0 && padding_needed <= 255 {
-                        // PKCS#7 padding: all padding bytes have the same value (the padding length)
-                        for _ in 0..padding_needed {
-                            padded_payload.push(padding_needed as u8);
-                        }
-                        debug_println!("[PRIVATE] Added {} bytes of PKCS#7 padding", padding_needed);
-                    } else if padding_needed == 0 {
-                        // If already at block size, don't add more padding
-                        debug_println!("[PRIVATE] Message already at block size, no padding needed");
-                    }
-                    
-                    // Encrypt the padded payload for the recipient
-                    match encryption_service.encrypt(&padded_payload, target_peer_id) {
-                        Ok(encrypted) => {
-                            debug_println!("[PRIVATE] Encrypted payload: {} bytes", encrypted.len());
-                            
-                            // Sign the encrypted payload
-                            let signature = encryption_service.sign(&encrypted);
-                            
-                            // Create packet with recipient ID for private routing
-                            let packet = create_bitchat_packet_with_recipient_and_signature(
-                                &my_peer_id,
-                                target_peer_id,  // Specify the recipient
-                                MessageType::Message,
-                                encrypted,
-                                Some(signature)
-                            );
-                            
-                            // Send the private message
-                            if let Err(_e) = send_packet_with_fragmentation(&peripheral, cmd_char, packet, &my_peer_id).await {
-                                println!("\n\x1b[91m❌ Failed to send private message\x1b[0m");
-                                    println!("\x1b[90mThe message could not be delivered. Connection may have been lost.\x1b[0m");
-                            } else {
-                                // Show the message was sent in a cleaner format
-                                let timestamp = chrono::Local::now();
-                                let display = format_message_display(
-                                    timestamp,
-                                    &nickname,  // sender
-                                    &line,
-                                    true, // is_private
-                                    false, // is_channel
-                                    None, // channel_name
-                                    Some(target_nickname), // recipient
-                                    &nickname, // my_nickname
-                                );
-                                // Move cursor up to overwrite the input line, clear it, print message
-                                print!("\x1b[1A\r\x1b[K{}\n", display);
-                                std::io::stdout().flush().unwrap();
-                            }
-                        },
-                        Err(e) => {
-                            println!("[!] Failed to encrypt private message: {:?}", e);
-                            println!("[!] Make sure you have received key exchange from {}", target_nickname);
-                        }
-                    }
-                    continue;
-                }
-                
-                // Regular public/channel message
-                // Only show echo in debug mode
-                debug_println!("{} > {}", chat_context.format_prompt(), line);
-                
-                let current_channel = chat_context.current_mode.get_channel().map(|s| s.to_string());
-                
-                // Check if trying to send to password-protected channel without key
-                if let Some(ref channel) = current_channel {
-                    if password_protected_channels.contains(channel) && !channel_keys.contains_key(channel) {
-                        println!("❌ Cannot send to password-protected channel {}. Join with password first.", channel);
-                        continue;
-                    }
-                }
-                
-                let (message_payload, message_id) = if let Some(ref channel) = current_channel {
-                    if let Some(channel_key) = channel_keys.get(channel) {
-                        // Encrypt the message content for the channel
-                        debug_println!("[ENCRYPT] Encrypting message for channel {} 🔒", channel);
-                        create_encrypted_channel_message_payload(&nickname, &line, channel, channel_key, &encryption_service, &my_peer_id)
-                    } else {
-                        let payload = create_bitchat_message_payload(&nickname, &line, current_channel.as_deref());
-                        (payload, Uuid::new_v4().to_string()) // Generate ID for old style messages
-                    }
-                } else {
-                    let payload = create_bitchat_message_payload(&nickname, &line, current_channel.as_deref());
-                    (payload, Uuid::new_v4().to_string()) // Generate ID for old style messages
-                };
-                
-                // Track the message for delivery confirmation (not for channel messages with 10+ peers)
-                let is_private = false;
-                delivery_tracker.track_message(message_id.clone(), line.clone(), is_private);
-                
-                debug_println!("[MESSAGE] ==================== SENDING USER MESSAGE ====================");
-                debug_println!("[MESSAGE] Message content: '{}'", line);
-                debug_println!("[MESSAGE] Message payload size: {} bytes", message_payload.len());
-                
-                // Sign the message payload
-                let signature = encryption_service.sign(&message_payload);
-                
-                // Create the complete message packet with signature
-                let message_packet = create_bitchat_packet_with_signature(&my_peer_id, MessageType::Message, message_payload.clone(), Some(signature));
-                
-                // Check if we need to fragment the COMPLETE PACKET (matching Swift behavior)
-                if should_fragment(&message_packet) {
-                    debug_println!("[MESSAGE] Complete packet ({} bytes) requires fragmentation", message_packet.len());
-                    
-                    // Use Swift-compatible fragmentation for complete packet
-                    if let Err(_e) = send_packet_with_fragmentation(&peripheral, cmd_char, message_packet, &my_peer_id).await {
-                        println!("\n\x1b[91m❌ Message delivery failed\x1b[0m");
-                        println!("\x1b[90mConnection lost. Please restart BitChat to reconnect.\x1b[0m");
-                        break;
-                    }
-                } else {
-                    // Send as single packet without fragmentation
-                    debug_println!("[MESSAGE] Sending message as single packet ({} bytes)", message_packet.len());
-                    
-                    // Use WithResponse for larger packets (matching Swift's 512 byte threshold)
-                    let write_type = if message_packet.len() > 512 {
-                        WriteType::WithResponse
-                    } else {
-                        WriteType::WithoutResponse
-                    };
-                    
-                    if peripheral.write(cmd_char, &message_packet, write_type).await.is_err() {
-                        println!("[!] Failed to send message. Connection likely lost.");
-                        break;
-                    }
-                    
-                    debug_println!("[MESSAGE] ✓ Successfully sent message packet");
-                }
-                debug_println!("[MESSAGE] ==================== MESSAGE SEND COMPLETE ====================");
-                
-                // Display the sent message in a clean format
-                let timestamp = chrono::Local::now();
-                let display = format_message_display(
-                    timestamp,
-                    &nickname,
+                // Send the message using the consolidated function
+                if let Err(_e) = send_message(
                     &line,
-                    false, // is_private
-                    current_channel.is_some(), // is_channel
-                    current_channel.as_deref(), // channel_name
-                    None, // recipient
-                    &nickname // my_nickname
-                );
-                // Move cursor up to overwrite the input line, clear it, print message
-                print!("\x1b[1A\r\x1b[K{}\n", display);
-                std::io::stdout().flush().unwrap();
+                    &nickname,
+                    &my_peer_id,
+                    &chat_context,
+                    &channel_keys,
+                    &password_protected_channels,
+                    &encryption_service,
+                    &mut delivery_tracker,
+                    &peripheral,
+                    cmd_char,
+                ).await {
+                    // Error handling is done inside send_message, just break if connection lost
+                    if _e.to_string().contains("Connection lost") || _e.to_string().contains("delivery failed") {
+                        break;
+                    }
+                }
 
             },
 
@@ -1930,7 +1905,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                     false, // is_channel
                                                     None, // channel_name
                                                     Some(&nickname), // recipient (me)
-                                                    &nickname // my_nickname
+                                                    &nickname, // my_nickname
                                                 );
                                                 // Clear any existing prompt and print the message
                                                 print!("\r\x1b[K{}\n", display);
@@ -1955,7 +1930,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                     true, // is_channel
                                                     Some(channel_name), // channel_name
                                                     None, // recipient
-                                                    &nickname // my_nickname
+                                                    &nickname, // my_nickname
                                                 );
                                                 // Clear any existing prompt and print the message
                                                 print!("\r\x1b[K{}\n", display);
@@ -1970,7 +1945,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                     false, // is_channel
                                                     None, // channel_name
                                                     None, // recipient
-                                                    &nickname // my_nickname
+                                                    &nickname, // my_nickname
                                                 );
                                                 // Clear any existing prompt and print the message
                                                 print!("\r\x1b[K{}\n> ", display);
@@ -2147,10 +2122,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                              message.channel.is_some(), // is_channel
                                                              message.channel.as_deref(),
                                                              if is_private_message { Some(&nickname) } else { None }, // recipient for private messages
-                                                             &nickname // my_nickname
+                                                             &nickname, // my_nickname
                                                          );
                                                          // Clear any existing prompt and print the message
-                                                print!("\r\x1b[K{}\n> ", display);
+                                                         print!("\r\x1b[K{}\n> ", display);
                                                 std::io::stdout().flush().unwrap();
                                                          
                                                          // If it's a private message, update chat context
@@ -3013,6 +2988,189 @@ pub fn should_fragment(packet_data: &[u8]) -> bool {
     packet_data.len() > 500  // Fragment complete packets larger than 500 bytes
 } 
 
+// Consolidated message sending function that handles both public/channel and private messages
+async fn send_message(
+    message: &str,
+    nickname: &str,
+    my_peer_id: &str,
+    chat_context: &ChatContext,
+    channel_keys: &HashMap<String, [u8; 32]>,
+    password_protected_channels: &HashSet<String>,
+    encryption_service: &Arc<EncryptionService>,
+    delivery_tracker: &mut DeliveryTracker,
+    peripheral: &Peripheral,
+    cmd_char: &btleplug::api::Characteristic,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Check if in DM mode
+    if let ChatMode::PrivateDM { nickname: target_nickname, peer_id: target_peer_id } = &chat_context.current_mode {
+        // SENDING PRIVATE MESSAGE
+        debug_println!("{} > {}", chat_context.format_prompt(), message);
+        debug_println!("[PRIVATE] Sending DM to {} (peer_id: {})", target_nickname, target_peer_id);
+        
+        let (message_payload, message_id) = create_bitchat_message_payload_full(nickname, message, None, true, my_peer_id);
+        
+        delivery_tracker.track_message(message_id.clone(), message.to_string(), true);
+        
+        // Pad the message for privacy using PKCS#7
+        let block_sizes = [256, 512, 1024, 2048];
+        let payload_size = message_payload.len();
+        let target_size = block_sizes.iter()
+            .find(|&&size| payload_size + 16 <= size)
+            .copied()
+            .unwrap_or(payload_size);
+        
+        let padding_needed = target_size - message_payload.len();
+        let mut padded_payload = message_payload.clone();
+        
+        if padding_needed > 0 && padding_needed <= 255 {
+            // PKCS#7 padding: all padding bytes have the same value (the padding length)
+            for _ in 0..padding_needed {
+                padded_payload.push(padding_needed as u8);
+            }
+            debug_println!("[PRIVATE] Added {} bytes of PKCS#7 padding", padding_needed);
+        } else if padding_needed == 0 {
+            // If already at block size, don't add more padding
+            debug_println!("[PRIVATE] Message already at block size, no padding needed");
+        }
+        
+        // Encrypt the padded payload for the recipient
+        match encryption_service.encrypt(&padded_payload, target_peer_id) {
+            Ok(encrypted) => {
+                debug_println!("[PRIVATE] Encrypted payload: {} bytes", encrypted.len());
+                
+                // Sign the encrypted payload
+                let signature = encryption_service.sign(&encrypted);
+                
+                // Create packet with recipient ID for private routing
+                let packet = create_bitchat_packet_with_recipient_and_signature(
+                    my_peer_id,
+                    target_peer_id,  // Specify the recipient
+                    MessageType::Message,
+                    encrypted,
+                    Some(signature)
+                );
+                
+                // Send the private message
+                if let Err(_e) = send_packet_with_fragmentation(&peripheral, cmd_char, packet, my_peer_id).await {
+                    println!("\n\x1b[91m❌ Failed to send private message\x1b[0m");
+                    println!("\x1b[90mThe message could not be delivered. Connection may have been lost.\x1b[0m");
+                    return Err("Failed to send private message".into());
+                } else {
+                    // Show the message was sent in a cleaner format
+                    let timestamp = chrono::Local::now();
+                    let display = format_message_display(
+                        timestamp,
+                        nickname,  // sender
+                        message,
+                        true, // is_private
+                        false, // is_channel
+                        None, // channel_name
+                        Some(target_nickname), // recipient
+                        nickname, // my_nickname
+                    );
+                    // Move cursor up to overwrite the input line, clear it, print message
+                    print!("\x1b[1A\r\x1b[K{}\n", display);
+                    std::io::stdout().flush().unwrap();
+                }
+            },
+            Err(e) => {
+                println!("[!] Failed to encrypt private message: {:?}", e);
+                println!("[!] Make sure you have received key exchange from {}", target_nickname);
+                return Err("Failed to encrypt private message".into());
+            }
+        }
+    } else {
+        // SENDING PUBLIC/CHANNEL MESSAGE
+        debug_println!("{} > {}", chat_context.format_prompt(), message);
+        
+        let current_channel = chat_context.current_mode.get_channel().map(|s| s.to_string());
+        
+        // Check if trying to send to password-protected channel without key
+        if let Some(ref channel) = current_channel {
+            if password_protected_channels.contains(channel) && !channel_keys.contains_key(channel) {
+                println!("❌ Cannot send to password-protected channel {}. Join with password first.", channel);
+                return Err("Cannot send to password-protected channel without key".into());
+            }
+        }
+        
+        let (message_payload, message_id) = if let Some(ref channel) = current_channel {
+            if let Some(channel_key) = channel_keys.get(channel) {
+                // Encrypt the message content for the channel
+                debug_println!("[ENCRYPT] Encrypting message for channel {} 🔒", channel);
+                create_encrypted_channel_message_payload(nickname, message, channel, channel_key, encryption_service, my_peer_id)
+            } else {
+                let payload = create_bitchat_message_payload(nickname, message, current_channel.as_deref());
+                (payload, Uuid::new_v4().to_string()) // Generate ID for old style messages
+            }
+        } else {
+            let payload = create_bitchat_message_payload(nickname, message, current_channel.as_deref());
+            (payload, Uuid::new_v4().to_string()) // Generate ID for old style messages
+        };
+        
+        // Track the message for delivery confirmation
+        let is_private = false;
+        delivery_tracker.track_message(message_id.clone(), message.to_string(), is_private);
+        
+        debug_println!("[MESSAGE] ==================== SENDING USER MESSAGE ====================");
+        debug_println!("[MESSAGE] Message content: '{}'", message);
+        debug_println!("[MESSAGE] Message payload size: {} bytes", message_payload.len());
+        
+        // Sign the message payload
+        let signature = encryption_service.sign(&message_payload);
+        
+        // Create the complete message packet with signature
+        let message_packet = create_bitchat_packet_with_signature(my_peer_id, MessageType::Message, message_payload.clone(), Some(signature));
+        
+        // Check if we need to fragment the COMPLETE PACKET (matching Swift behavior)
+        if should_fragment(&message_packet) {
+            debug_println!("[MESSAGE] Complete packet ({} bytes) requires fragmentation", message_packet.len());
+            
+            // Use Swift-compatible fragmentation for complete packet
+            if let Err(_e) = send_packet_with_fragmentation(&peripheral, cmd_char, message_packet, my_peer_id).await {
+                println!("\n\x1b[91m❌ Message delivery failed\x1b[0m");
+                println!("\x1b[90mConnection lost. Please restart BitChat to reconnect.\x1b[0m");
+                return Err("Message delivery failed".into());
+            }
+        } else {
+            // Send as single packet without fragmentation
+            debug_println!("[MESSAGE] Sending message as single packet ({} bytes)", message_packet.len());
+            
+            // Use WithResponse for larger packets (matching Swift's 512 byte threshold)
+            let write_type = if message_packet.len() > 512 {
+                WriteType::WithResponse
+            } else {
+                WriteType::WithoutResponse
+            };
+            
+            if peripheral.write(cmd_char, &message_packet, write_type).await.is_err() {
+                println!("[!] Failed to send message. Connection likely lost.");
+                return Err("Failed to send message".into());
+            }
+            
+            debug_println!("[MESSAGE] ✓ Successfully sent message packet");
+        }
+        debug_println!("[MESSAGE] ==================== MESSAGE SEND COMPLETE ====================");
+        
+        // Display the sent message in a clean format
+        let timestamp = chrono::Local::now();
+        let display = format_message_display(
+            timestamp,
+            nickname,
+            message,
+            false, // is_private
+            current_channel.is_some(), // is_channel
+            current_channel.as_deref(), // channel_name
+            None, // recipient
+            nickname // my_nickname
+        );
+        // Move cursor up to overwrite the input line, clear it, print message
+        print!("\x1b[1A\r\x1b[K{}\n", display);
+        std::io::stdout().flush().unwrap();
+    }
+    
+    Ok(())
+}
+
 // Swift-compatible packet sending with automatic fragmentation
 async fn send_packet_with_fragmentation(
     peripheral: &Peripheral,
@@ -3225,7 +3383,7 @@ mod tests {
         assert_eq!(FLAG_HAS_RECIPIENT, 0x01);
         assert_eq!(FLAG_HAS_SIGNATURE, 0x02);
         assert_eq!(FLAG_IS_COMPRESSED, 0x04);
-        assert_eq!(FLAG_HAS_CHANNEL, 0x40);
+        assert_eq!(MSG_FLAG_HAS_CHANNEL, 0x40);
         assert_eq!(SIGNATURE_SIZE, 64);
         assert_eq!(BROADCAST_RECIPIENT, [0xFF; 8]);
     }
