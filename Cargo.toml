@@ -28,3 +28,6 @@ dirs = "5.0"
 x25519-dalek = { version = "2.0", features = ["static_secrets", "getrandom"] }
 ed25519-dalek = { version = "2.0", features = ["rand_core"] }
 aes-gcm = { version = "0.10", features = ["aes"] }
+
+# Noise Protocol with snow crate  
+snow = "0.9.6"

@@ -70,13 +70,16 @@ macro_rules! debug_full_println {
 
 mod compression;
 mod fragmentation;
-mod encryption;
+// mod encryption;  // Removed - now using Noise-only implementation
 mod terminal_ux;
 mod persistence;
+mod noise;
+mod noise_integration;
 
 use compression::decompress;
 use fragmentation::{Fragment, FragmentType};
-use encryption::EncryptionService;
+use noise_integration::NoiseIntegrationService;
+// use encryption::EncryptionService;  // Removed - now using Noise-only
 use terminal_ux::{ChatContext, ChatMode, format_message_display, print_help};
 use persistence::{AppState, load_state, save_state, encrypt_password, decrypt_password};
 
@@ -121,7 +124,7 @@ const BROADCAST_RECIPIENT: [u8; 8] = [0xFF; 8];
 
 enum MessageType { 
     Announce = 0x01, 
-    KeyExchange = 0x02, 
+    NoiseHandshake = 0x02,       // Noise protocol handshake (replaces KeyExchange)
     Leave = 0x03,
     Message = 0x04,
     FragmentStart = 0x05,
@@ -132,6 +135,7 @@ enum MessageType {
     DeliveryAck = 0x0A,          // Acknowledge message received
     DeliveryStatusRequest = 0x0B,  // Request delivery status
     ReadReceipt = 0x0C,          // Message has been read
+    NoiseEncrypted = 0x0D,       // Noise encrypted message
 }
 
 #[derive(Debug, Default, Clone)]
@@ -410,18 +414,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut app_state = load_state();
     let mut nickname = app_state.nickname.clone().unwrap_or_else(|| "my-rust-client".to_string());
 
-    // Create encryption service
-    let encryption_service = Arc::new(EncryptionService::new());
-    let (key_exchange_payload, _) = generate_keys_and_payload(&encryption_service);
+    // Create Noise encryption service
+    let noise_service = Arc::new(NoiseIntegrationService::new().map_err(|e| {
+        eprintln!("Failed to initialize Noise service: {}", e);
+        std::io::Error::new(std::io::ErrorKind::Other, e)
+    })?);
 
-    let key_exchange_packet = create_bitchat_packet(&my_peer_id, MessageType::KeyExchange, key_exchange_payload);
+    // All encryption now handled by Noise protocol
 
-    peripheral.write(cmd_char, &key_exchange_packet, WriteType::WithoutResponse).await?;
+    // Get our static public key for sharing
+    let static_public_key = noise_service.get_static_public_key();
+    let identity_fingerprint = noise_service.get_identity_fingerprint();
+    
+    debug_println!("[NOISE] Our identity fingerprint: {}", identity_fingerprint);
 
-    // Add delay between key exchange and announce to ensure Android processes them properly
-    time::sleep(Duration::from_millis(500)).await;
+    // Create handshake initiation packet (we'll initiate with discovered peers)
+    // For now, just send our static public key in the announce
+    let announce_payload = format!("{}|{}", nickname, hex::encode(&static_public_key));
 
-    let announce_packet = create_bitchat_packet(&my_peer_id, MessageType::Announce, nickname.as_bytes().to_vec());
+    // Add small delay before announcing
+    time::sleep(Duration::from_millis(200)).await;
+
+    let announce_packet = create_bitchat_packet(&my_peer_id, MessageType::Announce, announce_payload.as_bytes().to_vec());
 
     peripheral.write(cmd_char, &announce_packet, WriteType::WithoutResponse).await?;
 
@@ -455,7 +469,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         for (channel, encrypted_password) in &app_state.encrypted_channel_passwords {
             match decrypt_password(encrypted_password, identity_key) {
                 Ok(password) => {
-                    let key = EncryptionService::derive_channel_key(&password, channel);
+                    let key = NoiseIntegrationService::derive_channel_key(&password, channel);
                     channel_keys.insert(channel.clone(), key);
                     debug_println!("[CHANNEL] Restored key for password-protected channel: {}", channel);
                 }
@@ -630,7 +644,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     println!("\x1b[90mMinimum 4 characters required.\x1b[0m");
                                     continue;
                                 }
-                                let key = EncryptionService::derive_channel_key(password, &channel_name);
+                                let key = NoiseIntegrationService::derive_channel_key(password, &channel_name);
                                 
                                 // Verify password against stored key commitment (iOS compatibility)
                                 if let Some(expected_commitment) = channel_key_commitments.get(&channel_name) {
@@ -712,7 +726,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             // Not password-protected or we have the key
                             if let Some(password) = parts.get(2) {
                                 // User provided password for a channel we haven't seen as protected yet
-                                let key = EncryptionService::derive_channel_key(password, &channel_name);
+                                let key = NoiseIntegrationService::derive_channel_key(password, &channel_name);
                                 channel_keys.insert(channel_name.clone(), key);
                                 discovered_channels.insert(channel_name.clone());
                                 chat_context.switch_to_channel_silent(&channel_name);
@@ -921,38 +935,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             debug_println!("[PRIVATE] Message already at block size, no padding needed");
                         }
                         
-                        // Encrypt the padded payload for the recipient
-                        match encryption_service.encrypt(&padded_payload, &target_peer_id) {
-                            Ok(encrypted) => {
-                                debug_println!("[PRIVATE] Encrypted payload: {} bytes", encrypted.len());
-                                
-                                // Sign the encrypted payload
-                                let signature = encryption_service.sign(&encrypted);
-                                
-                                // Create packet with recipient ID for private routing
-                                let packet = create_bitchat_packet_with_recipient_and_signature(
-                                    &my_peer_id,
-                                    &target_peer_id,  // Specify the recipient
-                                    MessageType::Message,
-                                    encrypted,
-                                    Some(signature)
-                                );
-                                
-                                // Send the private message
-                                if let Err(_e) = send_packet_with_fragmentation(&peripheral, cmd_char, packet, &my_peer_id).await {
-                                    println!("\n\x1b[91m❌ Failed to send private message\x1b[0m");
-                                    println!("\x1b[90mThe message could not be delivered. Connection may have been lost.\x1b[0m");
-                                } else {
-                                    debug_println!("[PRIVATE] Message sent to {}", target_nickname);
+                        // Check if we have an established Noise session with the target peer
+                        if noise_service.has_established_session(&target_peer_id) {
+                            // Use Noise encryption for this peer
+                            match noise_service.encrypt_for_peer(&target_peer_id, &padded_payload) {
+                                Ok(encrypted) => {
+                                    debug_println!("[NOISE] Encrypted private message: {} bytes", encrypted.len());
+                                    
+                                    // Create packet with Noise encrypted message type
+                                    let packet = create_bitchat_packet_with_recipient(
+                                        &my_peer_id,
+                                        Some(&target_peer_id),
+                                        MessageType::NoiseEncrypted,
+                                        encrypted,
+                                        None  // No separate signature needed with Noise
+                                    );
+                                    
+                                    // Send the private message
+                                    if let Err(_e) = send_packet_with_fragmentation(&peripheral, cmd_char, packet, &my_peer_id).await {
+                                        println!("\n\x1b[91m❌ Failed to send private message\x1b[0m");
+                                        println!("\x1b[90mThe message could not be delivered. Connection may have been lost.\x1b[0m");
+                                    } else {
+                                        debug_println!("[NOISE] Private message sent to {}", target_nickname);
+                                    }
+                                },
+                                Err(e) => {
+                                    println!("[!] Failed to encrypt message with Noise: {}", e);
                                 }
-                            },
+                            }
+                        } else {
+                            // Fall back to legacy encryption for peers without Noise sessions
+                            match noise_service.encrypt_for_peer(&target_peer_id, &padded_payload) {
+                                Ok(encrypted) => {
+                                    debug_println!("[PRIVATE] Encrypted payload (legacy): {} bytes", encrypted.len());
+                                    
+                                    // Sign the encrypted payload
+                                    let signature = noise_service.sign(&encrypted);
+                                    
+                                    // Create packet with recipient ID for private routing
+                                    let packet = create_bitchat_packet_with_recipient_and_signature(
+                                        &my_peer_id,
+                                        &target_peer_id,  // Specify the recipient
+                                        MessageType::Message,
+                                        encrypted,
+                                        Some(signature)
+                                    );
+                                    
+                                    // Send the private message
+                                    if let Err(_e) = send_packet_with_fragmentation(&peripheral, cmd_char, packet, &my_peer_id).await {
+                                        println!("\n\x1b[91m❌ Failed to send private message\x1b[0m");
+                                        println!("\x1b[90mThe message could not be delivered. Connection may have been lost.\x1b[0m");
+                                    } else {
+                                        debug_println!("[PRIVATE] Message sent to {}", target_nickname);
+                                    }
+                                },
                             Err(e) => {
                                 println!("[!] Failed to encrypt private message: {:?}", e);
                                 println!("[!] Make sure you have received key exchange from {}", target_nickname);
                             }
                         }
-                        continue;
-                    } else {
+                    }
+                    continue;
+                } else {
                         println!("\x1b[93m⚠ User '{}' not found\x1b[0m", target_nickname);
                         println!("\x1b[90mThey may be offline or using a different nickname.\x1b[0m");
                         continue;
@@ -975,7 +1019,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let mut blocked_nicknames = Vec::new();
                             
                             for (peer_id, peer) in peers_guard.iter() {
-                                if let Some(fingerprint) = encryption_service.get_peer_fingerprint(peer_id) {
+                                let fingerprint = noise_service.get_peer_fingerprint(peer_id)
+                                    .or_else(|| noise_service.get_peer_fingerprint(peer_id));
+                                if let Some(fingerprint) = fingerprint {
                                     if blocked_peers.contains(&fingerprint) {
                                         if let Some(nickname) = &peer.nickname {
                                             blocked_nicknames.push(nickname.clone());
@@ -1008,7 +1054,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         };
                         
                         if let Some(target_peer_id) = peer_id {
-                            if let Some(fingerprint) = encryption_service.get_peer_fingerprint(&target_peer_id) {
+                            let fingerprint = noise_service.get_peer_fingerprint(&target_peer_id)
+                                .or_else(|| noise_service.get_peer_fingerprint(&target_peer_id));
+                            if let Some(fingerprint) = fingerprint {
                                 if blocked_peers.contains(&fingerprint) {
                                     println!("» {} is already blocked.", nickname);
                                 } else {
@@ -1071,7 +1119,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     };
                     
                     if let Some(target_peer_id) = peer_id {
-                        if let Some(fingerprint) = encryption_service.get_peer_fingerprint(&target_peer_id) {
+                        let fingerprint = noise_service.get_peer_fingerprint(&target_peer_id)
+                            .or_else(|| noise_service.get_peer_fingerprint(&target_peer_id));
+                        if let Some(fingerprint) = fingerprint {
                             if blocked_peers.contains(&fingerprint) {
                                 blocked_peers.remove(&fingerprint);
                                 
@@ -1278,7 +1328,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                     
                                     // Derive new key
-                                    let new_key = EncryptionService::derive_channel_key(&new_password, channel);
+                                    let new_key = NoiseIntegrationService::derive_channel_key(&new_password, channel);
                                     
                                     // Store old key for notification
                                     let old_key = channel_keys.get(channel).cloned();
@@ -1310,14 +1360,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     // Send notification with old key if exists
                                     if let Some(old_key) = old_key {
                                         let notify_msg = "🔐 Password changed by channel owner. Please update your password.";
-                                        let encrypted_notify = match encryption_service.encrypt_with_key(notify_msg.as_bytes(), &old_key) {
+                                        let encrypted_notify = match noise_service.encrypt_with_channel_key(notify_msg.as_bytes(), &old_key) {
                                             Ok(enc) => enc,
                                             Err(_) => Vec::new(),
                                         };
                                         
                                         if !encrypted_notify.is_empty() {
                                             let (notify_payload, _) = create_encrypted_channel_message_payload(
-                                                &nickname, notify_msg, channel, &old_key, &encryption_service, &my_peer_id
+                                                &nickname, notify_msg, channel, &old_key, &noise_service, &my_peer_id
                                             );
                                             let notify_packet = create_bitchat_packet(&my_peer_id, MessageType::Message, notify_payload);
                                             let _ = send_packet_with_fragmentation(&peripheral, cmd_char, notify_packet, &my_peer_id).await;
@@ -1346,7 +1396,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     );
                                     
                                     let (init_payload, _) = create_encrypted_channel_message_payload(
-                                        &nickname, &init_msg, channel, &new_key, &encryption_service, &my_peer_id
+                                        &nickname, &init_msg, channel, &new_key, &noise_service, &my_peer_id
                                     );
                                     let init_packet = create_bitchat_packet(&my_peer_id, MessageType::Message, init_payload);
                                     let _ = send_packet_with_fragmentation(&peripheral, cmd_char, init_packet, &my_peer_id).await;
@@ -1386,7 +1436,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 channel_creators.insert(channel.clone(), my_peer_id.clone());
                                 
                                 // Derive key
-                                let new_key = EncryptionService::derive_channel_key(&new_password, channel);
+                                let new_key = NoiseIntegrationService::derive_channel_key(&new_password, channel);
                                 
                                 // Update keys and mark as protected
                                 channel_keys.insert(channel.clone(), new_key);
@@ -1581,48 +1631,78 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         debug_println!("[PRIVATE] Message already at block size, no padding needed");
                     }
                     
-                    // Encrypt the padded payload for the recipient
-                    match encryption_service.encrypt(&padded_payload, target_peer_id) {
-                        Ok(encrypted) => {
-                            debug_println!("[PRIVATE] Encrypted payload: {} bytes", encrypted.len());
-                            
-                            // Sign the encrypted payload
-                            let signature = encryption_service.sign(&encrypted);
-                            
-                            // Create packet with recipient ID for private routing
-                            let packet = create_bitchat_packet_with_recipient_and_signature(
-                                &my_peer_id,
-                                target_peer_id,  // Specify the recipient
-                                MessageType::Message,
-                                encrypted,
-                                Some(signature)
-                            );
-                            
-                            // Send the private message
-                            if let Err(_e) = send_packet_with_fragmentation(&peripheral, cmd_char, packet, &my_peer_id).await {
-                                println!("\n\x1b[91m❌ Failed to send private message\x1b[0m");
-                                    println!("\x1b[90mThe message could not be delivered. Connection may have been lost.\x1b[0m");
-                            } else {
-                                // Show the message was sent in a cleaner format
-                                let timestamp = chrono::Local::now();
-                                let display = format_message_display(
-                                    timestamp,
-                                    &nickname,  // sender
-                                    &line,
-                                    true, // is_private
-                                    false, // is_channel
-                                    None, // channel_name
-                                    Some(target_nickname), // recipient
-                                    &nickname, // my_nickname
+                    // Check if we have an established Noise session with the target peer
+                    if noise_service.has_established_session(target_peer_id) {
+                        // Use Noise encryption for this peer
+                        match noise_service.encrypt_for_peer(target_peer_id, &padded_payload) {
+                            Ok(encrypted) => {
+                                debug_println!("[NOISE] Encrypted private message: {} bytes", encrypted.len());
+                                
+                                // Create packet with Noise encrypted message type
+                                let packet = create_bitchat_packet_with_recipient(
+                                    &my_peer_id,
+                                    Some(target_peer_id),
+                                    MessageType::NoiseEncrypted,
+                                    encrypted,
+                                    None  // No separate signature needed with Noise
                                 );
-                                // Move cursor up to overwrite the input line, clear it, print message
-                                print!("\x1b[1A\r\x1b[K{}\n", display);
-                                std::io::stdout().flush().unwrap();
+                                
+                                // Send the private message
+                                if let Err(_e) = send_packet_with_fragmentation(&peripheral, cmd_char, packet, &my_peer_id).await {
+                                    println!("\n\x1b[91m❌ Failed to send private message\x1b[0m");
+                                    println!("\x1b[90mThe message could not be delivered. Connection may have been lost.\x1b[0m");
+                                } else {
+                                    debug_println!("[NOISE] Private message sent to {}", target_peer_id);
+                                }
+                            },
+                            Err(e) => {
+                                println!("[!] Failed to encrypt message with Noise: {}", e);
                             }
-                        },
-                        Err(e) => {
-                            println!("[!] Failed to encrypt private message: {:?}", e);
-                            println!("[!] Make sure you have received key exchange from {}", target_nickname);
+                        }
+                    } else {
+                        // Fall back to legacy encryption for peers without Noise sessions
+                        match noise_service.encrypt_for_peer(target_peer_id, &padded_payload) {
+                            Ok(encrypted) => {
+                                debug_println!("[PRIVATE] Encrypted payload (legacy): {} bytes", encrypted.len());
+                                
+                                // Sign the encrypted payload
+                                let signature = noise_service.sign(&encrypted);
+                                
+                                // Create packet with recipient ID for private routing
+                                let packet = create_bitchat_packet_with_recipient_and_signature(
+                                    &my_peer_id,
+                                    target_peer_id,  // Specify the recipient
+                                    MessageType::Message,
+                                    encrypted,
+                                    Some(signature)
+                                );
+                                
+                                // Send the private message
+                                if let Err(_e) = send_packet_with_fragmentation(&peripheral, cmd_char, packet, &my_peer_id).await {
+                                    println!("\n\x1b[91m❌ Failed to send private message\x1b[0m");
+                                    println!("\x1b[90mThe message could not be delivered. Connection may have been lost.\x1b[0m");
+                                } else {
+                                    // Show the message was sent in a cleaner format
+                                    let timestamp = chrono::Local::now();
+                                    let display = format_message_display(
+                                        timestamp,
+                                        &nickname,  // sender
+                                        &line,
+                                        true, // is_private
+                                        false, // is_channel
+                                        None, // channel_name
+                                        Some(target_nickname), // recipient
+                                        &nickname, // my_nickname
+                                    );
+                                    // Move cursor up to overwrite the input line, clear it, print message
+                                    print!("\x1b[1A\r\x1b[K{}\n", display);
+                                    std::io::stdout().flush().unwrap();
+                                }
+                            },
+                            Err(e) => {
+                                println!("[!] Failed to encrypt private message: {:?}", e);
+                                println!("[!] Make sure you have received key exchange from {}", target_nickname);
+                            }
                         }
                     }
                     continue;
@@ -1646,7 +1726,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Some(channel_key) = channel_keys.get(channel) {
                         // Encrypt the message content for the channel
                         debug_println!("[ENCRYPT] Encrypting message for channel {} 🔒", channel);
-                        create_encrypted_channel_message_payload(&nickname, &line, channel, channel_key, &encryption_service, &my_peer_id)
+                        create_encrypted_channel_message_payload(&nickname, &line, channel, channel_key, &noise_service, &my_peer_id)
                     } else {
                         let payload = create_bitchat_message_payload(&nickname, &line, current_channel.as_deref());
                         (payload, Uuid::new_v4().to_string()) // Generate ID for old style messages
@@ -1665,7 +1745,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 debug_println!("[MESSAGE] Message payload size: {} bytes", message_payload.len());
                 
                 // Sign the message payload
-                let signature = encryption_service.sign(&message_payload);
+                let signature = noise_service.sign(&message_payload);
                 
                 // Create the complete message packet with signature
                 let message_packet = create_bitchat_packet_with_signature(&my_peer_id, MessageType::Message, message_payload.clone(), Some(signature));
@@ -1760,7 +1840,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                              debug_full_println!("[DEBUG] Sender: {}", packet.sender_id_str);
                              
                              // Check if sender is blocked
-                             if let Some(fingerprint) = encryption_service.get_peer_fingerprint(&packet.sender_id_str) {
+                             let fingerprint = noise_service.get_peer_fingerprint(&packet.sender_id_str)
+                                 .or_else(|| noise_service.get_peer_fingerprint(&packet.sender_id_str));
+                             if let Some(fingerprint) = fingerprint {
                                  if blocked_peers.contains(&fingerprint) {
                                      debug_println!("[BLOCKED] Ignoring message from blocked peer: {}", packet.sender_id_str);
                                      continue; // Silent drop
@@ -1822,7 +1904,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                  debug_println!("[PRIVATE] Payload size: {} bytes", packet.payload.len());
                                  debug_println!("[PRIVATE] First 32 bytes of encrypted payload: {}", hex::encode(&packet.payload[..std::cmp::min(32, packet.payload.len())]));
                                  
-                                 match encryption_service.decrypt(&packet.payload, &packet.sender_id_str) {
+                                 match noise_service.decrypt_from_peer(&packet.sender_id_str, &packet.payload) {
                                      Ok(decrypted) => {
                                          debug_println!("[PRIVATE] Successfully decrypted private message!");
                                          debug_println!("[PRIVATE] Decrypted size: {} bytes", decrypted.len());
@@ -1891,7 +1973,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                     if let Some(channel_key) = channel_keys.get(channel) {
                                                         // Decrypt the encrypted content
                                                         if let Some(encrypted_bytes) = &message.encrypted_content {
-                                                            match encryption_service.decrypt_with_key(encrypted_bytes, channel_key) {
+                                                            match noise_service.decrypt_with_channel_key(encrypted_bytes, channel_key) {
                                                             Ok(decrypted) => String::from_utf8_lossy(&decrypted).to_string(),
                                                                 Err(_) => "[Encrypted message - decryption failed]".to_string()
                                                             }
@@ -1996,12 +2078,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                              
                                              // Encrypt ACK if it's a private message
                                              let final_ack_payload = if is_private_message {
-                                                 // Encrypt the ACK for the sender
-                                                 match encryption_service.encrypt_for_peer(&packet.sender_id_str, &ack_payload) {
-                                                     Ok(encrypted) => encrypted,
-                                                     Err(e) => {
-                                                         debug_println!("[ACK] Failed to encrypt ACK: {:?}", e);
-                                                         ack_payload
+                                                 // Try Noise encryption first, fall back to legacy
+                                                 if noise_service.has_established_session(&packet.sender_id_str) {
+                                                     match noise_service.encrypt_for_peer(&packet.sender_id_str, &ack_payload) {
+                                                         Ok(encrypted) => encrypted,
+                                                         Err(e) => {
+                                                             debug_println!("[ACK] Failed to encrypt ACK with Noise: {:?}", e);
+                                                             ack_payload
+                                                         }
+                                                     }
+                                                 } else {
+                                                     // Use legacy encryption
+                                                     match noise_service.encrypt_for_peer(&packet.sender_id_str, &ack_payload) {
+                                                         Ok(encrypted) => encrypted,
+                                                         Err(e) => {
+                                                             debug_println!("[ACK] Failed to encrypt ACK: {:?}", e);
+                                                             ack_payload
+                                                         }
                                                      }
                                                  }
                                              } else {
@@ -2073,7 +2166,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                      if let Ok(reassembled_packet) = parse_bitchat_packet(&complete_data) {
                                          if reassembled_packet.msg_type == MessageType::Message {
                                              // Check if sender is blocked
-                                             if let Some(fingerprint) = encryption_service.get_peer_fingerprint(&reassembled_packet.sender_id_str) {
+                                             let fingerprint = noise_service.get_peer_fingerprint(&reassembled_packet.sender_id_str)
+                                                 .or_else(|| noise_service.get_peer_fingerprint(&reassembled_packet.sender_id_str));
+                                             if let Some(fingerprint) = fingerprint {
                                                  if blocked_peers.contains(&fingerprint) {
                                                      debug_println!("[BLOCKED] Ignoring fragmented message from blocked peer: {}", reassembled_packet.sender_id_str);
                                                      continue; // Silent drop
@@ -2097,7 +2192,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                              
                                              // Handle private messages by decrypting first
                                              let message_result = if is_private_message {
-                                                 match encryption_service.decrypt(&reassembled_packet.payload, &reassembled_packet.sender_id_str) {
+                                                 match noise_service.decrypt_from_peer(&reassembled_packet.sender_id_str, &reassembled_packet.payload) {
                                                      Ok(decrypted) => {
                                                          debug_println!("[PRIVATE] Successfully decrypted fragmented private message!");
                                                          debug_println!("[PRIVATE] Decrypted size: {} bytes", decrypted.len());
@@ -2178,26 +2273,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                  }
                              }
                          },
-                         MessageType::KeyExchange => {
-                             // Extract public key
-                             let public_key = packet.payload.clone();
-                             debug_println!("[<-- RECV] Key exchange from {} (key: {} bytes)", packet.sender_id_str, public_key.len());
-                             debug_full_println!("[CRYPTO] Key exchange payload first 32 bytes: {}", hex::encode(&public_key[..std::cmp::min(32, public_key.len())]));
+                         MessageType::NoiseHandshake => {
+                             // Handle Noise protocol handshake
+                             debug_println!("[<-- RECV] Noise handshake from {} ({} bytes)", packet.sender_id_str, packet.payload.len());
                              
-                             // Add peer's public key to encryption service
-                             if let Err(e) = encryption_service.add_peer_public_key(&packet.sender_id_str, &public_key) {
-                                 println!("[!] Failed to add peer public key: {:?}", e);
-                             } else {
-                                 debug_println!("[+] Successfully added encryption keys for peer {}", packet.sender_id_str);
-                                 
-                                 // Send our key exchange back if we haven't already
-                                 if !peers_lock.contains_key(&packet.sender_id_str) {
-                                     debug_full_println!("[CRYPTO] Sending key exchange response to {}", packet.sender_id_str);
-                                     let (key_exchange_payload, _) = generate_keys_and_payload(&encryption_service);
-                                     let key_exchange_packet = create_bitchat_packet(&my_peer_id, MessageType::KeyExchange, key_exchange_payload);
-                                     if let Err(e) = peripheral.write(cmd_char, &key_exchange_packet, WriteType::WithoutResponse).await {
-                                         println!("[!] Failed to send key exchange response: {}", e);
+                             // Process the handshake message
+                             match noise_service.process_handshake_message(&packet.sender_id_str, &packet.payload) {
+                                 Ok(Some(response)) => {
+                                     // Send handshake response
+                                     debug_println!("[NOISE] Sending handshake response to {}", packet.sender_id_str);
+                                     let response_packet = create_bitchat_packet(&my_peer_id, MessageType::NoiseHandshake, response);
+                                     if let Err(e) = peripheral.write(cmd_char, &response_packet, WriteType::WithoutResponse).await {
+                                         println!("[!] Failed to send Noise handshake response: {}", e);
                                      }
+                                 },
+                                 Ok(None) => {
+                                     // Handshake complete
+                                     debug_println!("[+] Noise handshake completed with peer {}", packet.sender_id_str);
+                                     
+                                     // Add peer to our known peers list if not already there
+                                     if !peers_lock.contains_key(&packet.sender_id_str) {
+                                         peers_lock.insert(packet.sender_id_str.clone(), Peer { nickname: None });
+                                     }
+                                 },
+                                 Err(e) => {
+                                     println!("[!] Failed to process Noise handshake from {}: {}", packet.sender_id_str, e);
                                  }
                              }
                          },
@@ -2291,11 +2391,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             
                             if is_for_us {
                                 // Decrypt the ACK payload if it's encrypted
-                                let ack_payload = if packet.ttl == 3 && encryption_service.has_peer_key(&packet.sender_id_str) {
+                                let ack_payload = if packet.ttl == 3 {
                                     // ACKs might be encrypted for private messages
-                                    match encryption_service.decrypt(&packet.payload, &packet.sender_id_str) {
-                                        Ok(decrypted) => decrypted,
-                                        Err(_) => packet.payload.clone() // Fall back to unencrypted
+                                    if noise_service.has_established_session(&packet.sender_id_str) {
+                                        // Try Noise decryption
+                                        match noise_service.decrypt_from_peer(&packet.sender_id_str, &packet.payload) {
+                                            Ok(decrypted) => decrypted,
+                                            Err(_) => packet.payload.clone() // Fall back to unencrypted
+                                        }
+                                    } else if noise_service.has_established_session(&packet.sender_id_str) {
+                                        // Try legacy decryption
+                                        match noise_service.decrypt_from_peer(&packet.sender_id_str, &packet.payload) {
+                                            Ok(decrypted) => decrypted,
+                                            Err(_) => packet.payload.clone() // Fall back to unencrypted
+                                        }
+                                    } else {
+                                        packet.payload.clone() // Unencrypted
                                     }
                                 } else {
                                     packet.payload.clone()
@@ -2331,6 +2442,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         MessageType::ReadReceipt => {
                             // iOS defines this but doesn't implement it yet
                             debug_println!("[<-- RECV] Read receipt (not implemented)");
+                        },
+                        
+                        MessageType::NoiseEncrypted => {
+                            // Handle Noise encrypted messages
+                            debug_println!("[<-- RECV] Noise encrypted message from {} ({} bytes)", packet.sender_id_str, packet.payload.len());
+                            
+                            match noise_service.decrypt_from_peer(&packet.sender_id_str, &packet.payload) {
+                                Ok(decrypted_data) => {
+                                    debug_println!("[NOISE] Successfully decrypted message ({} bytes)", decrypted_data.len());
+                                    
+                                    // Parse the decrypted data as a regular message
+                                    match parse_bitchat_message_payload(&decrypted_data) {
+                                        Ok(message) => {
+                                            if !bloom.check(&message.id) {
+                                                let sender_nick = peers_lock.get(&packet.sender_id_str)
+                                                    .and_then(|p| p.nickname.as_ref())
+                                                    .map_or(&packet.sender_id_str, |n| n);
+                                                
+                                                // Display the decrypted message as a private message
+                                                let timestamp = chrono::Local::now();
+                                                let display = format_message_display(
+                                                    timestamp,
+                                                    sender_nick,
+                                                    &message.content,
+                                                    true, // is_private
+                                                    false, // is_channel
+                                                    None, // channel
+                                                    Some(&nickname), // recipient for private messages
+                                                    &nickname // my_nickname
+                                                );
+                                                
+                                                print!("\r\x1b[K{}\n> ", display);
+                                                std::io::stdout().flush().unwrap();
+                                                
+                                                // Update chat context for reply functionality
+                                                chat_context.last_private_sender = Some((packet.sender_id_str.clone(), sender_nick.to_string()));
+                                                
+                                                bloom.set(&message.id);
+                                            }
+                                        },
+                                        Err(e) => {
+                                            debug_println!("[NOISE] Failed to parse decrypted message: {}", e);
+                                        }
+                                    }
+                                },
+                                Err(e) => {
+                                    debug_println!("[NOISE] Failed to decrypt message from {}: {}", packet.sender_id_str, e);
+                                }
+                            }
                         },
                         
                         _ => {}
@@ -2597,7 +2757,7 @@ fn create_encrypted_channel_message_payload(
     content: &str, 
     channel: &str, 
     channel_key: &[u8; 32],
-    encryption_service: &EncryptionService,
+    noise_service: &NoiseIntegrationService,
     sender_peer_id: &str
 ) -> (Vec<u8>, String) {
     // Create message with encrypted content (matching Swift implementation)
@@ -2617,7 +2777,7 @@ fn create_encrypted_channel_message_payload(
     data.extend_from_slice(sender.as_bytes());
     
     // Encrypt the actual content
-    let encrypted_content = match encryption_service.encrypt_with_key(content.as_bytes(), channel_key) {
+    let encrypted_content = match noise_service.encrypt_with_channel_key(content.as_bytes(), channel_key) {
         Ok(encrypted) => encrypted,
         Err(e) => {
             println!("[!] Failed to encrypt message: {:?}", e);
@@ -2675,7 +2835,7 @@ fn parse_bitchat_packet(data: &[u8]) -> Result<BitchatPacket, &'static str> {
     offset += 1;
     let msg_type = match msg_type_raw {
         0x01 => MessageType::Announce, 
-        0x02 => MessageType::KeyExchange, 
+        0x02 => MessageType::NoiseHandshake, 
         0x03 => MessageType::Leave,
         0x04 => MessageType::Message,
         0x05 => MessageType::FragmentStart,
@@ -2686,6 +2846,7 @@ fn parse_bitchat_packet(data: &[u8]) -> Result<BitchatPacket, &'static str> {
         0x0A => MessageType::DeliveryAck,
         0x0B => MessageType::DeliveryStatusRequest,
         0x0C => MessageType::ReadReceipt,
+        0x0D => MessageType::NoiseEncrypted,
         _ => return Err("Unknown message type."),
     };
 
@@ -2763,19 +2924,7 @@ fn parse_bitchat_packet(data: &[u8]) -> Result<BitchatPacket, &'static str> {
     Ok(BitchatPacket { msg_type, _sender_id: sender_id, sender_id_str, recipient_id, recipient_id_str, payload, ttl })
 }
 
-fn generate_keys_and_payload(encryption_service: &EncryptionService) -> (Vec<u8>, String) {
-    // Use the encryption service to get the combined public key data
-    let payload = encryption_service.get_combined_public_key_data();
-    
-    // Generate fingerprint from identity key (last 32 bytes of the 96-byte payload)
-    let identity_key_bytes = &payload[64..96];
-    let mut hasher = Sha256::new();
-    hasher.update(identity_key_bytes);
-    let hash_result = hasher.finalize();
-    let fingerprint = hex::encode(&hash_result[..8]);
-    
-    (payload, fingerprint)
-}
+// Legacy function removed - now using Noise-only implementation
 
 fn create_bitchat_packet(sender_id_str: &str, msg_type: MessageType, payload: Vec<u8>) -> Vec<u8> {
     create_bitchat_packet_with_recipient(sender_id_str, None, msg_type, payload, None)
@@ -3206,7 +3355,7 @@ mod tests {
         // Verify MessageType enum values match the protocol specification
         // This ensures compatibility with Swift and Android implementations
         assert_eq!(MessageType::Announce as u8, 0x01);
-        assert_eq!(MessageType::KeyExchange as u8, 0x02);
+        assert_eq!(MessageType::NoiseHandshake as u8, 0x02);
         assert_eq!(MessageType::Leave as u8, 0x03);
         assert_eq!(MessageType::Message as u8, 0x04);
         assert_eq!(MessageType::FragmentStart as u8, 0x05);
@@ -3225,7 +3374,7 @@ mod tests {
         assert_eq!(FLAG_HAS_RECIPIENT, 0x01);
         assert_eq!(FLAG_HAS_SIGNATURE, 0x02);
         assert_eq!(FLAG_IS_COMPRESSED, 0x04);
-        assert_eq!(FLAG_HAS_CHANNEL, 0x40);
+        assert_eq!(MSG_FLAG_HAS_CHANNEL, 0x40);
         assert_eq!(SIGNATURE_SIZE, 64);
         assert_eq!(BROADCAST_RECIPIENT, [0xFF; 8]);
     }
