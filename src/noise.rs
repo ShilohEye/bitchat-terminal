@@ -2,7 +2,7 @@
 // Based on the Swift implementation using the snow crate
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, Mutex};
 use std::time::{SystemTime, Duration};
 use snow::{Builder, HandshakeState, TransportState, params::NoiseParams};
 use rand::RngCore;
@@ -64,7 +64,7 @@ pub struct NoiseSession {
     role: NoiseRole,
     state: NoiseSessionState,
     handshake: Option<HandshakeState>,
-    transport: Option<TransportState>,
+    transport: Option<Mutex<TransportState>>,
     #[allow(dead_code)]
     created_at: SystemTime,
     remote_static_key: Option<Vec<u8>>,
@@ -146,7 +146,7 @@ impl NoiseSession {
                 let transport = handshake.into_transport_mode()
                     .map_err(|e| NoiseError::HandshakeError(format!("Failed to enter transport mode: {}", e)))?;
                 
-                self.transport = Some(transport);
+                self.transport = Some(Mutex::new(transport));
                 self.state = NoiseSessionState::Established;
                 // handshake is already None due to take()
 
@@ -167,7 +167,7 @@ impl NoiseSession {
                     let transport = handshake.into_transport_mode()
                         .map_err(|e| NoiseError::HandshakeError(format!("Failed to enter transport mode: {}", e)))?;
                     
-                    self.transport = Some(transport);
+                    self.transport = Some(Mutex::new(transport));
                     self.state = NoiseSessionState::Established;
                     // handshake is already None due to take()
                 } else {
@@ -187,7 +187,8 @@ impl NoiseSession {
             return Err(NoiseError::EncryptionError("Session not established".to_string()));
         }
 
-        if let Some(ref mut transport) = self.transport {
+        if let Some(ref transport_mutex) = self.transport {
+            let mut transport = transport_mutex.lock().unwrap();
             let mut buffer = vec![0u8; plaintext.len() + 16]; // Add space for tag
             let len = transport.write_message(plaintext, &mut buffer)
                 .map_err(|e| NoiseError::EncryptionError(format!("Failed to encrypt: {}", e)))?;
@@ -203,7 +204,8 @@ impl NoiseSession {
             return Err(NoiseError::EncryptionError("Session not established".to_string()));
         }
 
-        if let Some(ref mut transport) = self.transport {
+        if let Some(ref transport_mutex) = self.transport {
+            let mut transport = transport_mutex.lock().unwrap();
             let mut buffer = vec![0u8; ciphertext.len()];
             let len = transport.read_message(ciphertext, &mut buffer)
                 .map_err(|e| NoiseError::EncryptionError(format!("Failed to decrypt: {}", e)))?;

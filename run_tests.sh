@@ -24,8 +24,8 @@ fi
 
 echo "🔧 Building test container and running tests..."
 
-# Build and run using the test Dockerfile
+# Build and run using the optimized test Dockerfile
 docker build -f Dockerfile.test -t bitchat-test "$CURRENT_DIR"
-docker run --rm bitchat-test cargo test $TEST_FILTER --release
+docker run --rm bitchat-test cargo test $TEST_FILTER
 
 echo "✅ Tests completed successfully!"

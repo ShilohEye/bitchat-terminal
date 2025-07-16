@@ -19,7 +19,7 @@ use std::convert::TryInto;
 
 use std::sync::{Arc, Mutex};
 
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use std::env;
 
@@ -124,18 +124,31 @@ const BROADCAST_RECIPIENT: [u8; 8] = [0xFF; 8];
 
 enum MessageType { 
     Announce = 0x01, 
-    NoiseHandshake = 0x02,       // Noise protocol handshake (replaces KeyExchange)
+    // 0x02 was legacy keyExchange - removed (matching Swift)
     Leave = 0x03,
-    Message = 0x04,
+    Message = 0x04,              // All user messages (private and broadcast)
     FragmentStart = 0x05,
     FragmentContinue = 0x06,
     FragmentEnd = 0x07,
-    ChannelAnnounce = 0x08,      // Channel status announcement (matches Swift v2 code)
-    ChannelRetention = 0x09,     // Channel retention policy (matches Swift v2 code)
+    ChannelAnnounce = 0x08,      // Announce password-protected channel status
+    ChannelRetention = 0x09,     // Announce channel retention status
     DeliveryAck = 0x0A,          // Acknowledge message received
-    DeliveryStatusRequest = 0x0B,  // Request delivery status
-    ReadReceipt = 0x0C,          // Message has been read
-    NoiseEncrypted = 0x0D,       // Noise encrypted message
+    DeliveryStatusRequest = 0x0B, // Request delivery status update
+    ReadReceipt = 0x0C,          // Message has been read/viewed
+    
+    // Noise Protocol messages (matching Swift exactly)
+    NoiseHandshakeInit = 0x10,   // Noise handshake initiation
+    NoiseHandshakeResp = 0x11,   // Noise handshake response  
+    NoiseEncrypted = 0x12,       // Noise encrypted transport message
+    NoiseIdentityAnnounce = 0x13, // Announce static public key for discovery
+    ChannelKeyVerifyRequest = 0x14, // Request key verification for a channel
+    ChannelKeyVerifyResponse = 0x15, // Response to key verification request
+    ChannelPasswordUpdate = 0x16, // Distribute new password to channel members
+    ChannelMetadata = 0x17,      // Announce channel creator and metadata
+    
+    // Protocol version negotiation (matching Swift exactly)
+    VersionHello = 0x20,         // Initial version announcement
+    VersionAck = 0x21,           // Version acknowledgment
 }
 
 #[derive(Debug, Default, Clone)]
@@ -204,6 +217,155 @@ impl DeliveryTracker {
     
     fn should_send_ack(&mut self, ack_id: &str) -> bool {
         self.sent_acks.insert(ack_id.to_string())
+    }
+}
+
+// Protocol version negotiation structures
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct VersionHello {
+    #[serde(rename = "supportedVersions")]
+    supported_versions: Vec<u8>,
+    #[serde(rename = "preferredVersion")]
+    preferred_version: u8,
+    #[serde(rename = "clientVersion")]
+    client_version: String,
+    platform: String,
+    capabilities: Option<Vec<String>>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct VersionAck {
+    #[serde(rename = "agreedVersion")]
+    agreed_version: u8,
+    #[serde(rename = "serverVersion")]
+    server_version: String,
+    platform: String,
+    capabilities: Option<Vec<String>>,
+    rejected: bool,
+    reason: Option<String>,
+}
+
+// Noise identity announcement structure
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct NoiseIdentityAnnouncement {
+    #[serde(rename = "peerID")]
+    peer_id: String,
+    #[serde(rename = "publicKey")]
+    public_key: Vec<u8>,
+    nickname: String,
+    timestamp: u64,
+    #[serde(rename = "previousPeerID")]
+    previous_peer_id: Option<String>,
+    signature: Vec<u8>,
+}
+
+// Channel key verification structures
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct ChannelKeyVerifyRequest {
+    channel: String,
+    #[serde(rename = "requesterID")]
+    requester_id: String,
+    #[serde(rename = "keyCommitment")]
+    key_commitment: String,
+    timestamp: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct ChannelKeyVerifyResponse {
+    channel: String,
+    #[serde(rename = "responderID")]
+    responder_id: String,
+    verified: bool,
+    timestamp: u64,
+}
+
+// Channel password update structure
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct ChannelPasswordUpdate {
+    channel: String,
+    #[serde(rename = "ownerID")]
+    owner_id: String,
+    #[serde(rename = "ownerFingerprint")]
+    owner_fingerprint: String,
+    #[serde(rename = "encryptedPassword")]
+    encrypted_password: Vec<u8>,
+    #[serde(rename = "newKeyCommitment")]
+    new_key_commitment: String,
+    timestamp: u64,
+}
+
+// Channel metadata structure
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct ChannelMetadata {
+    channel: String,
+    #[serde(rename = "creatorID")]
+    creator_id: String,
+    #[serde(rename = "creatorFingerprint")]
+    creator_fingerprint: String,
+    #[serde(rename = "createdAt")]
+    created_at: u64,
+    #[serde(rename = "isPasswordProtected")]
+    is_password_protected: bool,
+    #[serde(rename = "keyCommitment")]
+    key_commitment: Option<String>,
+}
+
+// Delivery status request structure
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct DeliveryStatusRequest {
+    #[serde(rename = "messageID")]
+    message_id: String,
+    #[serde(rename = "requesterID")]
+    requester_id: String,
+    timestamp: u64,
+}
+
+// Read receipt structure  
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct ReadReceipt {
+    #[serde(rename = "originalMessageID")]
+    original_message_id: String,
+    #[serde(rename = "receiptID")]
+    receipt_id: String,
+    #[serde(rename = "readerID")]
+    reader_id: String,
+    #[serde(rename = "readerNickname")]
+    reader_nickname: String,
+    timestamp: u64,
+}
+
+// Protocol version management
+struct ProtocolVersionManager {
+    supported_versions: Vec<u8>,
+    current_version: u8,
+    peer_versions: HashMap<String, u8>,
+}
+
+impl ProtocolVersionManager {
+    fn new() -> Self {
+        Self {
+            supported_versions: vec![1],
+            current_version: 1,
+            peer_versions: HashMap::new(),
+        }
+    }
+    
+    fn negotiate_version(&self, peer_versions: &[u8]) -> Option<u8> {
+        // Find highest common version
+        for &version in self.supported_versions.iter().rev() {
+            if peer_versions.contains(&version) {
+                return Some(version);
+            }
+        }
+        None
+    }
+    
+    fn set_peer_version(&mut self, peer_id: String, version: u8) {
+        self.peer_versions.insert(peer_id, version);
+    }
+    
+    fn get_peer_version(&self, peer_id: &str) -> Option<u8> {
+        self.peer_versions.get(peer_id).copied()
     }
 }
 
@@ -461,6 +623,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut fragment_collector = FragmentCollector::new();
     let mut delivery_tracker = DeliveryTracker::new();
+    let mut protocol_version_manager = ProtocolVersionManager::new();
 
     let mut chat_context = ChatContext::new();
     let mut channel_keys: HashMap<String, [u8; 32]> = HashMap::new();
@@ -984,7 +1147,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let packet = create_bitchat_packet_with_recipient(
                                         &my_peer_id,
                                         Some(&target_peer_id),
-                                        MessageType::NoiseHandshake,
+                                        MessageType::NoiseHandshakeInit,
                                         handshake_msg,
                                         None
                                     );
@@ -1677,7 +1840,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let packet = create_bitchat_packet_with_recipient(
                                     &my_peer_id,
                                     Some(target_peer_id),
-                                    MessageType::NoiseHandshake,
+                                    MessageType::NoiseHandshakeInit,
                                     handshake_msg,
                                     None
                                 );
@@ -2260,18 +2423,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                  }
                              }
                          },
-                         MessageType::NoiseHandshake => {
-                             // Handle Noise protocol handshake
-                             debug_println!("[<-- RECV] Noise handshake from {} ({} bytes)", packet.sender_id_str, packet.payload.len());
+                         MessageType::NoiseHandshakeInit => {
+                             // Handle Noise protocol handshake initiation
+                             debug_println!("[<-- RECV] Noise handshake init from {} ({} bytes)", packet.sender_id_str, packet.payload.len());
                              
                              // Process the handshake message
                              match noise_service.process_handshake_message(&packet.sender_id_str, &packet.payload) {
                                  Ok(Some(response)) => {
-                                     // Send handshake response
+                                     // Send handshake response with correct recipient
                                      debug_println!("[NOISE] Sending handshake response to {}", packet.sender_id_str);
-                                     let response_packet = create_bitchat_packet(&my_peer_id, MessageType::NoiseHandshake, response);
+                                     let response_packet = create_bitchat_packet_with_recipient(
+                                         &my_peer_id, 
+                                         Some(&packet.sender_id_str), 
+                                         MessageType::NoiseHandshakeResp, 
+                                         response,
+                                         None
+                                     );
                                      if let Err(e) = peripheral.write(cmd_char, &response_packet, WriteType::WithoutResponse).await {
                                          println!("[!] Failed to send Noise handshake response: {}", e);
+                                     }
+                                 },
+                                 Ok(None) => {
+                                     // Handshake complete (shouldn't happen on init, but handle gracefully)
+                                     debug_println!("[+] Noise handshake completed with peer {}", packet.sender_id_str);
+                                     
+                                     // Add peer to our known peers list if not already there
+                                     if !peers_lock.contains_key(&packet.sender_id_str) {
+                                         peers_lock.insert(packet.sender_id_str.clone(), Peer { nickname: None });
+                                     }
+                                 },
+                                 Err(e) => {
+                                     println!("[!] Failed to process Noise handshake init from {}: {}", packet.sender_id_str, e);
+                                 }
+                             }
+                         },
+                         MessageType::NoiseHandshakeResp => {
+                             // Handle Noise protocol handshake response
+                             debug_println!("[<-- RECV] Noise handshake response from {} ({} bytes)", packet.sender_id_str, packet.payload.len());
+                             
+                             // Process the handshake response
+                             match noise_service.process_handshake_message(&packet.sender_id_str, &packet.payload) {
+                                 Ok(Some(final_msg)) => {
+                                     // Send final handshake message (if needed)
+                                     debug_println!("[NOISE] Sending final handshake message to {}", packet.sender_id_str);
+                                     let final_packet = create_bitchat_packet_with_recipient(
+                                         &my_peer_id, 
+                                         Some(&packet.sender_id_str), 
+                                         MessageType::NoiseHandshakeResp, 
+                                         final_msg,
+                                         None
+                                     );
+                                     if let Err(e) = peripheral.write(cmd_char, &final_packet, WriteType::WithoutResponse).await {
+                                         println!("[!] Failed to send final Noise handshake message: {}", e);
                                      }
                                  },
                                  Ok(None) => {
@@ -2284,7 +2487,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                      }
                                  },
                                  Err(e) => {
-                                     println!("[!] Failed to process Noise handshake from {}: {}", packet.sender_id_str, e);
+                                     println!("[!] Failed to process Noise handshake response from {}: {}", packet.sender_id_str, e);
                                  }
                              }
                          },
@@ -2422,13 +2625,427 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         },
                         
                         MessageType::DeliveryStatusRequest => {
-                            // iOS defines this but doesn't implement it yet
-                            debug_println!("[<-- RECV] Delivery status request (not implemented)");
+                            // Handle delivery status request
+                            debug_println!("[<-- RECV] Delivery status request from {} ({} bytes)", packet.sender_id_str, packet.payload.len());
+                            
+                            match serde_json::from_slice::<DeliveryStatusRequest>(&packet.payload) {
+                                Ok(status_request) => {
+                                    debug_println!("[DELIVERY] Status request for message {} from {}", 
+                                        status_request.message_id, status_request.requester_id);
+                                    
+                                    // Check if we have this message in our delivery tracker
+                                    if let Some((content, sent_time, is_private)) = delivery_tracker.pending_messages.get(&status_request.message_id) {
+                                        debug_println!("[DELIVERY] Found message {} - sending confirmation", status_request.message_id);
+                                        
+                                        // Send delivery acknowledgment
+                                        let delivery_ack = DeliveryAck {
+                                            original_message_id: status_request.message_id.clone(),
+                                            ack_id: Uuid::new_v4().to_string(),
+                                            recipient_id: my_peer_id.clone(),
+                                            recipient_nickname: nickname.clone(),
+                                            timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64,
+                                            hop_count: 1,
+                                        };
+                                        
+                                        if let Ok(ack_payload) = serde_json::to_vec(&delivery_ack) {
+                                            let ack_packet = create_bitchat_packet_with_recipient(
+                                                &my_peer_id, 
+                                                Some(&packet.sender_id_str), 
+                                                MessageType::DeliveryAck, 
+                                                ack_payload,
+                                                None
+                                            );
+                                            if let Err(e) = peripheral.write(cmd_char, &ack_packet, WriteType::WithoutResponse).await {
+                                                println!("[!] Failed to send delivery ack: {}", e);
+                                            }
+                                        }
+                                    } else {
+                                        debug_println!("[DELIVERY] Message {} not found in our records", status_request.message_id);
+                                    }
+                                },
+                                Err(e) => {
+                                    debug_println!("[!] Failed to parse DeliveryStatusRequest: {}", e);
+                                }
+                            }
                         },
                         
                         MessageType::ReadReceipt => {
-                            // iOS defines this but doesn't implement it yet
-                            debug_println!("[<-- RECV] Read receipt (not implemented)");
+                            // Handle read receipt
+                            debug_println!("[<-- RECV] Read receipt from {} ({} bytes)", packet.sender_id_str, packet.payload.len());
+                            
+                            match serde_json::from_slice::<ReadReceipt>(&packet.payload) {
+                                Ok(read_receipt) => {
+                                    debug_println!("[READ_RECEIPT] Message {} read by {} ({})", 
+                                        read_receipt.original_message_id, read_receipt.reader_nickname, read_receipt.reader_id);
+                                    
+                                    // Update delivery status if we're tracking this message
+                                    if delivery_tracker.pending_messages.contains_key(&read_receipt.original_message_id) {
+                                        println!("👁️  Message read by {} ({})", read_receipt.reader_nickname, read_receipt.reader_id);
+                                        
+                                        // Mark as read - we can remove from pending since read is the final status
+                                        delivery_tracker.mark_delivered(&read_receipt.original_message_id);
+                                    }
+                                },
+                                Err(e) => {
+                                    debug_println!("[!] Failed to parse ReadReceipt: {}", e);
+                                }
+                            }
+                        },
+                        
+                        MessageType::VersionHello => {
+                            // Handle protocol version negotiation hello
+                            debug_println!("[<-- RECV] Version hello from {} ({} bytes)", packet.sender_id_str, packet.payload.len());
+                            
+                            match serde_json::from_slice::<VersionHello>(&packet.payload) {
+                                Ok(version_hello) => {
+                                    debug_println!("[VERSION] Received hello: supported={:?}, preferred={}, client={}, platform={}", 
+                                        version_hello.supported_versions, version_hello.preferred_version, 
+                                        version_hello.client_version, version_hello.platform);
+                                    
+                                    // Negotiate version
+                                    if let Some(agreed_version) = protocol_version_manager.negotiate_version(&version_hello.supported_versions) {
+                                        protocol_version_manager.set_peer_version(packet.sender_id_str.clone(), agreed_version);
+                                        
+                                        // Send VersionAck
+                                        let version_ack = VersionAck {
+                                            agreed_version,
+                                            server_version: "1.0.0".to_string(),
+                                            platform: "rust-terminal".to_string(),
+                                            capabilities: Some(vec!["noise".to_string(), "channels".to_string()]),
+                                            rejected: false,
+                                            reason: None,
+                                        };
+                                        
+                                        if let Ok(ack_payload) = serde_json::to_vec(&version_ack) {
+                                            debug_println!("[VERSION] Sending version ack with agreed version {}", agreed_version);
+                                            let ack_packet = create_bitchat_packet_with_recipient(
+                                                &my_peer_id, 
+                                                Some(&packet.sender_id_str), 
+                                                MessageType::VersionAck, 
+                                                ack_payload,
+                                                None
+                                            );
+                                            if let Err(e) = peripheral.write(cmd_char, &ack_packet, WriteType::WithoutResponse).await {
+                                                println!("[!] Failed to send version ack: {}", e);
+                                            }
+                                        }
+                                    } else {
+                                        // No compatible version found
+                                        let version_ack = VersionAck {
+                                            agreed_version: 0,
+                                            server_version: "1.0.0".to_string(),
+                                            platform: "rust-terminal".to_string(),
+                                            capabilities: None,
+                                            rejected: true,
+                                            reason: Some("No compatible protocol version".to_string()),
+                                        };
+                                        
+                                        if let Ok(ack_payload) = serde_json::to_vec(&version_ack) {
+                                            debug_println!("[VERSION] Rejecting version negotiation - no compatible version");
+                                            let ack_packet = create_bitchat_packet_with_recipient(
+                                                &my_peer_id, 
+                                                Some(&packet.sender_id_str), 
+                                                MessageType::VersionAck, 
+                                                ack_payload,
+                                                None
+                                            );
+                                            if let Err(e) = peripheral.write(cmd_char, &ack_packet, WriteType::WithoutResponse).await {
+                                                println!("[!] Failed to send version rejection: {}", e);
+                                            }
+                                        }
+                                    }
+                                },
+                                Err(e) => {
+                                    debug_println!("[!] Failed to parse VersionHello: {}", e);
+                                }
+                            }
+                        },
+                        
+                        MessageType::VersionAck => {
+                            // Handle protocol version negotiation acknowledgment
+                            debug_println!("[<-- RECV] Version ack from {} ({} bytes)", packet.sender_id_str, packet.payload.len());
+                            
+                            match serde_json::from_slice::<VersionAck>(&packet.payload) {
+                                Ok(version_ack) => {
+                                    if version_ack.rejected {
+                                        debug_println!("[VERSION] Version negotiation rejected by {}: {}", 
+                                            packet.sender_id_str, 
+                                            version_ack.reason.unwrap_or("No reason given".to_string()));
+                                        println!("⚠️  Protocol version negotiation failed with peer {}", packet.sender_id_str);
+                                    } else {
+                                        protocol_version_manager.set_peer_version(packet.sender_id_str.clone(), version_ack.agreed_version);
+                                        debug_println!("[VERSION] Negotiated version {} with {} (platform: {}, version: {})", 
+                                            version_ack.agreed_version, packet.sender_id_str, 
+                                            version_ack.platform, version_ack.server_version);
+                                        
+                                        if let Some(capabilities) = &version_ack.capabilities {
+                                            debug_println!("[VERSION] Peer capabilities: {:?}", capabilities);
+                                        }
+                                        
+                                        println!("🤝 Protocol version {} negotiated with {}", version_ack.agreed_version, packet.sender_id_str);
+                                    }
+                                },
+                                Err(e) => {
+                                    debug_println!("[!] Failed to parse VersionAck: {}", e);
+                                }
+                            }
+                        },
+                        
+                        MessageType::NoiseIdentityAnnounce => {
+                            // Handle Noise identity announcement
+                            debug_println!("[<-- RECV] Noise identity announce from {} ({} bytes)", packet.sender_id_str, packet.payload.len());
+                            
+                            match serde_json::from_slice::<NoiseIdentityAnnouncement>(&packet.payload) {
+                                Ok(identity_announce) => {
+                                    debug_println!("[IDENTITY] Received announcement: peer_id={}, nickname={}, key_len={}", 
+                                        identity_announce.peer_id, identity_announce.nickname, identity_announce.public_key.len());
+                                    
+                                    // Verify signature (basic implementation)
+                                    if let Some(signature_bytes) = noise_service.sign(&identity_announce.public_key) {
+                                        debug_println!("[IDENTITY] Identity signature verified for {}", identity_announce.peer_id);
+                                        
+                                        // Store peer information  
+                                        {
+                                            let mut peers_lock = peers.lock().unwrap();
+                                            peers_lock.insert(identity_announce.peer_id.clone(), Peer { 
+                                                nickname: Some(identity_announce.nickname.clone()) 
+                                            });
+                                        }
+                                        
+                                        // Store public key in noise service
+                                        noise_service.store_peer_public_key(&identity_announce.peer_id, identity_announce.public_key);
+                                        
+                                        // If this is a peer ID rotation, handle previous peer ID
+                                        if let Some(previous_id) = &identity_announce.previous_peer_id {
+                                            debug_println!("[IDENTITY] Peer {} rotated from previous ID {}", 
+                                                identity_announce.peer_id, previous_id);
+                                            
+                                            // Remove old peer ID but keep the established session if any
+                                            let mut peers_lock = peers.lock().unwrap();
+                                            peers_lock.remove(previous_id);
+                                        }
+                                        
+                                        println!("🆔 Identity announced by {} ({})", identity_announce.nickname, identity_announce.peer_id);
+                                    } else {
+                                        debug_println!("[!] Failed to verify identity signature for {}", identity_announce.peer_id);
+                                    }
+                                },
+                                Err(e) => {
+                                    debug_println!("[!] Failed to parse NoiseIdentityAnnouncement: {}", e);
+                                }
+                            }
+                        },
+                        
+                        MessageType::ChannelKeyVerifyRequest => {
+                            // Handle channel key verification request
+                            debug_println!("[<-- RECV] Channel key verify request from {} ({} bytes)", packet.sender_id_str, packet.payload.len());
+                            
+                            match serde_json::from_slice::<ChannelKeyVerifyRequest>(&packet.payload) {
+                                Ok(verify_request) => {
+                                    debug_println!("[CHANNEL_VERIFY] Request for channel '{}' from {}", 
+                                        verify_request.channel, verify_request.requester_id);
+                                    
+                                    // Check if we have the key for this channel
+                                    let verified = if let Some(channel_key) = channel_keys.get(&verify_request.channel) {
+                                        // Compute our key commitment
+                                        let our_commitment = {
+                                            let hash = sha2::Sha256::digest(channel_key);
+                                            hex::encode(hash)
+                                        };
+                                        
+                                        // Compare with requester's commitment
+                                        let matches = our_commitment == verify_request.key_commitment;
+                                        debug_println!("[CHANNEL_VERIFY] Key commitment {} (ours: {}, theirs: {})", 
+                                            if matches { "MATCHES" } else { "MISMATCH" }, 
+                                            our_commitment, verify_request.key_commitment);
+                                        matches
+                                    } else {
+                                        debug_println!("[CHANNEL_VERIFY] We don't have key for channel '{}'", verify_request.channel);
+                                        false
+                                    };
+                                    
+                                    // Send response
+                                    let verify_response = ChannelKeyVerifyResponse {
+                                        channel: verify_request.channel.clone(),
+                                        responder_id: my_peer_id.clone(),
+                                        verified,
+                                        timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64,
+                                    };
+                                    
+                                    if let Ok(response_payload) = serde_json::to_vec(&verify_response) {
+                                        debug_println!("[CHANNEL_VERIFY] Sending response: verified={}", verified);
+                                        let response_packet = create_bitchat_packet_with_recipient(
+                                            &my_peer_id, 
+                                            Some(&packet.sender_id_str), 
+                                            MessageType::ChannelKeyVerifyResponse, 
+                                            response_payload,
+                                            None
+                                        );
+                                        if let Err(e) = peripheral.write(cmd_char, &response_packet, WriteType::WithoutResponse).await {
+                                            println!("[!] Failed to send channel key verify response: {}", e);
+                                        }
+                                    }
+                                },
+                                Err(e) => {
+                                    debug_println!("[!] Failed to parse ChannelKeyVerifyRequest: {}", e);
+                                }
+                            }
+                        },
+                        
+                        MessageType::ChannelKeyVerifyResponse => {
+                            // Handle channel key verification response
+                            debug_println!("[<-- RECV] Channel key verify response from {} ({} bytes)", packet.sender_id_str, packet.payload.len());
+                            
+                            match serde_json::from_slice::<ChannelKeyVerifyResponse>(&packet.payload) {
+                                Ok(verify_response) => {
+                                    debug_println!("[CHANNEL_VERIFY] Response for channel '{}' from {}: verified={}", 
+                                        verify_response.channel, verify_response.responder_id, verify_response.verified);
+                                    
+                                    if verify_response.verified {
+                                        println!("✅ Channel key verified for '{}' by {}", verify_response.channel, packet.sender_id_str);
+                                    } else {
+                                        println!("❌ Channel key mismatch for '{}' reported by {}", verify_response.channel, packet.sender_id_str);
+                                    }
+                                },
+                                Err(e) => {
+                                    debug_println!("[!] Failed to parse ChannelKeyVerifyResponse: {}", e);
+                                }
+                            }
+                        },
+                        
+                        MessageType::ChannelPasswordUpdate => {
+                            // Handle channel password update
+                            debug_println!("[<-- RECV] Channel password update from {} ({} bytes)", packet.sender_id_str, packet.payload.len());
+                            
+                            match serde_json::from_slice::<ChannelPasswordUpdate>(&packet.payload) {
+                                Ok(password_update) => {
+                                    debug_println!("[CHANNEL_PWD] Update for channel '{}' from owner {}", 
+                                        password_update.channel, password_update.owner_id);
+                                    
+                                    // Verify this is from the channel owner
+                                    if let Some(known_owner) = channel_creators.get(&password_update.channel) {
+                                        if known_owner != &password_update.owner_id {
+                                            debug_println!("[!] Password update rejected: not from known owner {} (got {})", 
+                                                known_owner, password_update.owner_id);
+                                            continue;
+                                        }
+                                    }
+                                    
+                                    // Try to decrypt the new password using Noise session
+                                    if noise_service.has_established_session(&packet.sender_id_str) {
+                                        match noise_service.decrypt_from_peer(&packet.sender_id_str, &password_update.encrypted_password) {
+                                            Ok(decrypted_data) => {
+                                                if let Ok(new_password) = String::from_utf8(decrypted_data) {
+                                                    debug_println!("[CHANNEL_PWD] Successfully decrypted new password for '{}'", password_update.channel);
+                                                    
+                                                    // Derive new channel key
+                                                    let new_key = crate::noise_integration::NoiseIntegrationService::derive_channel_key(&new_password, &password_update.channel);
+                                                    
+                                                    // Verify key commitment
+                                                    let computed_commitment = {
+                                                        let hash = sha2::Sha256::digest(&new_key);
+                                                        hex::encode(hash)
+                                                    };
+                                                    
+                                                    if computed_commitment == password_update.new_key_commitment {
+                                                        // Update our channel key
+                                                        channel_keys.insert(password_update.channel.clone(), new_key);
+                                                        
+                                                        // Update key commitment
+                                                        channel_key_commitments.insert(password_update.channel.clone(), password_update.new_key_commitment.clone());
+                                                        
+                                                        // Save the encrypted password
+                                                        if let Some(identity_key) = &app_state.identity_key {
+                                                            match encrypt_password(&new_password, identity_key) {
+                                                                Ok(encrypted_password) => {
+                                                                    app_state.encrypted_channel_passwords.insert(password_update.channel.clone(), encrypted_password);
+                                                                    
+                                                                    // Save state
+                                                                    let state_to_save = create_app_state(
+                                                                        &blocked_peers,
+                                                                        &channel_creators,
+                                                                        &chat_context.active_channels,
+                                                                        &password_protected_channels,
+                                                                        &channel_key_commitments,
+                                                                        &app_state.encrypted_channel_passwords,
+                                                                        &nickname
+                                                                    );
+                                                                    if let Err(e) = save_state(&state_to_save) {
+                                                                        eprintln!("Warning: Could not save state: {}", e);
+                                                                    }
+                                                                },
+                                                                Err(e) => {
+                                                                    debug_println!("[!] Failed to encrypt new password: {}", e);
+                                                                }
+                                                            }
+                                                        }
+                                                        
+                                                        println!("🔄 Channel password updated for '{}'", password_update.channel);
+                                                    } else {
+                                                        debug_println!("[!] Key commitment mismatch for password update");
+                                                    }
+                                                } else {
+                                                    debug_println!("[!] Failed to decode decrypted password as UTF-8");
+                                                }
+                                            },
+                                            Err(e) => {
+                                                debug_println!("[!] Failed to decrypt password update: {}", e);
+                                            }
+                                        }
+                                    } else {
+                                        debug_println!("[!] No Noise session established with sender for password update");
+                                    }
+                                },
+                                Err(e) => {
+                                    debug_println!("[!] Failed to parse ChannelPasswordUpdate: {}", e);
+                                }
+                            }
+                        },
+                        
+                        MessageType::ChannelMetadata => {
+                            // Handle channel metadata
+                            debug_println!("[<-- RECV] Channel metadata from {} ({} bytes)", packet.sender_id_str, packet.payload.len());
+                            
+                            match serde_json::from_slice::<ChannelMetadata>(&packet.payload) {
+                                Ok(metadata) => {
+                                    debug_println!("[CHANNEL_META] Channel '{}' created by {} at {}, protected: {}", 
+                                        metadata.channel, metadata.creator_id, metadata.created_at, metadata.is_password_protected);
+                                    
+                                    // Store channel creator information
+                                    channel_creators.insert(metadata.channel.clone(), metadata.creator_id.clone());
+                                    
+                                    // Update password protection status
+                                    if metadata.is_password_protected {
+                                        password_protected_channels.insert(metadata.channel.clone());
+                                    } else {
+                                        password_protected_channels.remove(&metadata.channel);
+                                    }
+                                    
+                                    // Store key commitment if available
+                                    if let Some(key_commitment) = &metadata.key_commitment {
+                                        channel_key_commitments.insert(metadata.channel.clone(), key_commitment.clone());
+                                    }
+                                    
+                                    // Save state
+                                    let state_to_save = create_app_state(
+                                        &blocked_peers,
+                                        &channel_creators,
+                                        &chat_context.active_channels,
+                                        &password_protected_channels,
+                                        &channel_key_commitments,
+                                        &app_state.encrypted_channel_passwords,
+                                        &nickname
+                                    );
+                                    if let Err(e) = save_state(&state_to_save) {
+                                        eprintln!("Warning: Could not save state: {}", e);
+                                    }
+                                    
+                                    println!("📋 Channel metadata received for '{}' (created by {})", metadata.channel, metadata.creator_id);
+                                },
+                                Err(e) => {
+                                    debug_println!("[!] Failed to parse ChannelMetadata: {}", e);
+                                }
+                            }
                         },
                         
                         MessageType::NoiseEncrypted => {
@@ -2822,7 +3439,7 @@ fn parse_bitchat_packet(data: &[u8]) -> Result<BitchatPacket, &'static str> {
     offset += 1;
     let msg_type = match msg_type_raw {
         0x01 => MessageType::Announce, 
-        0x02 => MessageType::NoiseHandshake, 
+        // 0x02 was legacy keyExchange - removed (matching Swift)
         0x03 => MessageType::Leave,
         0x04 => MessageType::Message,
         0x05 => MessageType::FragmentStart,
@@ -2833,7 +3450,18 @@ fn parse_bitchat_packet(data: &[u8]) -> Result<BitchatPacket, &'static str> {
         0x0A => MessageType::DeliveryAck,
         0x0B => MessageType::DeliveryStatusRequest,
         0x0C => MessageType::ReadReceipt,
-        0x0D => MessageType::NoiseEncrypted,
+        // Noise Protocol messages (matching Swift exactly)
+        0x10 => MessageType::NoiseHandshakeInit,
+        0x11 => MessageType::NoiseHandshakeResp,
+        0x12 => MessageType::NoiseEncrypted,
+        0x13 => MessageType::NoiseIdentityAnnounce,
+        0x14 => MessageType::ChannelKeyVerifyRequest,
+        0x15 => MessageType::ChannelKeyVerifyResponse,
+        0x16 => MessageType::ChannelPasswordUpdate,
+        0x17 => MessageType::ChannelMetadata,
+        // Protocol version negotiation
+        0x20 => MessageType::VersionHello,
+        0x21 => MessageType::VersionAck,
         _ => return Err("Unknown message type."),
     };
 
@@ -3338,11 +3966,238 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_version_hello_parsing() {
+        let version_hello = VersionHello {
+            supported_versions: vec![1, 2],
+            preferred_version: 2,
+            client_version: "1.0.0".to_string(),
+            platform: "rust-test".to_string(),
+            capabilities: Some(vec!["noise".to_string(), "channels".to_string()]),
+        };
+        
+        let serialized = serde_json::to_vec(&version_hello).unwrap();
+        let deserialized: VersionHello = serde_json::from_slice(&serialized).unwrap();
+        
+        assert_eq!(deserialized.supported_versions, vec![1, 2]);
+        assert_eq!(deserialized.preferred_version, 2);
+        assert_eq!(deserialized.client_version, "1.0.0");
+        assert_eq!(deserialized.platform, "rust-test");
+        assert_eq!(deserialized.capabilities, Some(vec!["noise".to_string(), "channels".to_string()]));
+    }
+
+    #[test]
+    fn test_version_ack_parsing() {
+        let version_ack = VersionAck {
+            agreed_version: 1,
+            server_version: "1.0.0".to_string(),
+            platform: "rust-test".to_string(),
+            capabilities: Some(vec!["noise".to_string()]),
+            rejected: false,
+            reason: None,
+        };
+        
+        let serialized = serde_json::to_vec(&version_ack).unwrap();
+        let deserialized: VersionAck = serde_json::from_slice(&serialized).unwrap();
+        
+        assert_eq!(deserialized.agreed_version, 1);
+        assert_eq!(deserialized.rejected, false);
+        assert_eq!(deserialized.reason, None);
+    }
+
+    #[test]
+    fn test_version_ack_rejection() {
+        let version_ack = VersionAck {
+            agreed_version: 0,
+            server_version: "1.0.0".to_string(),
+            platform: "rust-test".to_string(),
+            capabilities: None,
+            rejected: true,
+            reason: Some("No compatible version".to_string()),
+        };
+        
+        let serialized = serde_json::to_vec(&version_ack).unwrap();
+        let deserialized: VersionAck = serde_json::from_slice(&serialized).unwrap();
+        
+        assert_eq!(deserialized.rejected, true);
+        assert_eq!(deserialized.reason, Some("No compatible version".to_string()));
+    }
+
+    #[test]
+    fn test_protocol_version_negotiation() {
+        let mut manager = ProtocolVersionManager::new();
+        
+        // Test successful negotiation
+        let peer_versions = vec![1, 2, 3];
+        let negotiated = manager.negotiate_version(&peer_versions);
+        assert_eq!(negotiated, Some(1)); // Should pick highest common version
+        
+        // Test failed negotiation
+        let incompatible_versions = vec![2, 3, 4];
+        let negotiated = manager.negotiate_version(&incompatible_versions);
+        assert_eq!(negotiated, None);
+        
+        // Test peer version storage
+        manager.set_peer_version("peer1".to_string(), 1);
+        assert_eq!(manager.get_peer_version("peer1"), Some(1));
+        assert_eq!(manager.get_peer_version("unknown"), None);
+    }
+
+    #[test]
+    fn test_noise_identity_announcement_parsing() {
+        let announcement = NoiseIdentityAnnouncement {
+            peer_id: "test_peer".to_string(),
+            public_key: vec![1, 2, 3, 4],
+            nickname: "TestUser".to_string(),
+            timestamp: 1234567890,
+            previous_peer_id: Some("old_peer".to_string()),
+            signature: vec![5, 6, 7, 8],
+        };
+        
+        let serialized = serde_json::to_vec(&announcement).unwrap();
+        let deserialized: NoiseIdentityAnnouncement = serde_json::from_slice(&serialized).unwrap();
+        
+        assert_eq!(deserialized.peer_id, "test_peer");
+        assert_eq!(deserialized.public_key, vec![1, 2, 3, 4]);
+        assert_eq!(deserialized.nickname, "TestUser");
+        assert_eq!(deserialized.previous_peer_id, Some("old_peer".to_string()));
+    }
+
+    #[test]
+    fn test_channel_key_verify_request_parsing() {
+        let request = ChannelKeyVerifyRequest {
+            channel: "#test".to_string(),
+            requester_id: "requester".to_string(),
+            key_commitment: "abc123".to_string(),
+            timestamp: 1234567890,
+        };
+        
+        let serialized = serde_json::to_vec(&request).unwrap();
+        let deserialized: ChannelKeyVerifyRequest = serde_json::from_slice(&serialized).unwrap();
+        
+        assert_eq!(deserialized.channel, "#test");
+        assert_eq!(deserialized.requester_id, "requester");
+        assert_eq!(deserialized.key_commitment, "abc123");
+    }
+
+    #[test]
+    fn test_channel_key_verify_response_parsing() {
+        let response = ChannelKeyVerifyResponse {
+            channel: "#test".to_string(),
+            responder_id: "responder".to_string(),
+            verified: true,
+            timestamp: 1234567890,
+        };
+        
+        let serialized = serde_json::to_vec(&response).unwrap();
+        let deserialized: ChannelKeyVerifyResponse = serde_json::from_slice(&serialized).unwrap();
+        
+        assert_eq!(deserialized.channel, "#test");
+        assert_eq!(deserialized.responder_id, "responder");
+        assert_eq!(deserialized.verified, true);
+    }
+
+    #[test]
+    fn test_channel_password_update_parsing() {
+        let update = ChannelPasswordUpdate {
+            channel: "#secret".to_string(),
+            owner_id: "owner".to_string(),
+            owner_fingerprint: "fingerprint123".to_string(),
+            encrypted_password: vec![1, 2, 3, 4, 5],
+            new_key_commitment: "newcommit456".to_string(),
+            timestamp: 1234567890,
+        };
+        
+        let serialized = serde_json::to_vec(&update).unwrap();
+        let deserialized: ChannelPasswordUpdate = serde_json::from_slice(&serialized).unwrap();
+        
+        assert_eq!(deserialized.channel, "#secret");
+        assert_eq!(deserialized.owner_id, "owner");
+        assert_eq!(deserialized.encrypted_password, vec![1, 2, 3, 4, 5]);
+        assert_eq!(deserialized.new_key_commitment, "newcommit456");
+    }
+
+    #[test]
+    fn test_channel_metadata_parsing() {
+        let metadata = ChannelMetadata {
+            channel: "#public".to_string(),
+            creator_id: "creator".to_string(),
+            creator_fingerprint: "creatorprint".to_string(),
+            created_at: 1234567890,
+            is_password_protected: true,
+            key_commitment: Some("commitment789".to_string()),
+        };
+        
+        let serialized = serde_json::to_vec(&metadata).unwrap();
+        let deserialized: ChannelMetadata = serde_json::from_slice(&serialized).unwrap();
+        
+        assert_eq!(deserialized.channel, "#public");
+        assert_eq!(deserialized.creator_id, "creator");
+        assert_eq!(deserialized.is_password_protected, true);
+        assert_eq!(deserialized.key_commitment, Some("commitment789".to_string()));
+    }
+
+    #[test]
+    fn test_delivery_status_request_parsing() {
+        let request = DeliveryStatusRequest {
+            message_id: "msg123".to_string(),
+            requester_id: "requester".to_string(),
+            timestamp: 1234567890,
+        };
+        
+        let serialized = serde_json::to_vec(&request).unwrap();
+        let deserialized: DeliveryStatusRequest = serde_json::from_slice(&serialized).unwrap();
+        
+        assert_eq!(deserialized.message_id, "msg123");
+        assert_eq!(deserialized.requester_id, "requester");
+        assert_eq!(deserialized.timestamp, 1234567890);
+    }
+
+    #[test]
+    fn test_read_receipt_parsing() {
+        let receipt = ReadReceipt {
+            original_message_id: "original123".to_string(),
+            receipt_id: "receipt456".to_string(),
+            reader_id: "reader".to_string(),
+            reader_nickname: "ReaderName".to_string(),
+            timestamp: 1234567890,
+        };
+        
+        let serialized = serde_json::to_vec(&receipt).unwrap();
+        let deserialized: ReadReceipt = serde_json::from_slice(&serialized).unwrap();
+        
+        assert_eq!(deserialized.original_message_id, "original123");
+        assert_eq!(deserialized.receipt_id, "receipt456");
+        assert_eq!(deserialized.reader_id, "reader");
+        assert_eq!(deserialized.reader_nickname, "ReaderName");
+    }
+
+    #[test]
+    fn test_delivery_ack_compatibility() {
+        // Test compatibility with existing DeliveryAck structure
+        let ack = DeliveryAck {
+            original_message_id: "msg123".to_string(),
+            ack_id: "ack456".to_string(),
+            recipient_id: "recipient".to_string(),
+            recipient_nickname: "RecipientName".to_string(),
+            timestamp: 1234567890,
+            hop_count: 2,
+        };
+        
+        let serialized = serde_json::to_vec(&ack).unwrap();
+        let deserialized: DeliveryAck = serde_json::from_slice(&serialized).unwrap();
+        
+        assert_eq!(deserialized.original_message_id, "msg123");
+        assert_eq!(deserialized.ack_id, "ack456");
+        assert_eq!(deserialized.recipient_id, "recipient");
+        assert_eq!(deserialized.hop_count, 2);
+    }
+
+    #[test]
     fn test_message_type_values() {
-        // Verify MessageType enum values match the protocol specification
-        // This ensures compatibility with Swift and Android implementations
+        // Verify MessageType enum values match the Swift protocol specification exactly
+        // This ensures compatibility with Swift and other implementations
         assert_eq!(MessageType::Announce as u8, 0x01);
-        assert_eq!(MessageType::NoiseHandshake as u8, 0x02);
+        // 0x02 was legacy keyExchange - removed (matching Swift)
         assert_eq!(MessageType::Leave as u8, 0x03);
         assert_eq!(MessageType::Message as u8, 0x04);
         assert_eq!(MessageType::FragmentStart as u8, 0x05);
@@ -3353,6 +4208,20 @@ mod tests {
         assert_eq!(MessageType::DeliveryAck as u8, 0x0A);
         assert_eq!(MessageType::DeliveryStatusRequest as u8, 0x0B);
         assert_eq!(MessageType::ReadReceipt as u8, 0x0C);
+        
+        // Noise Protocol messages (matching Swift exactly)
+        assert_eq!(MessageType::NoiseHandshakeInit as u8, 0x10);
+        assert_eq!(MessageType::NoiseHandshakeResp as u8, 0x11);
+        assert_eq!(MessageType::NoiseEncrypted as u8, 0x12);
+        assert_eq!(MessageType::NoiseIdentityAnnounce as u8, 0x13);
+        assert_eq!(MessageType::ChannelKeyVerifyRequest as u8, 0x14);
+        assert_eq!(MessageType::ChannelKeyVerifyResponse as u8, 0x15);
+        assert_eq!(MessageType::ChannelPasswordUpdate as u8, 0x16);
+        assert_eq!(MessageType::ChannelMetadata as u8, 0x17);
+        
+        // Protocol version negotiation
+        assert_eq!(MessageType::VersionHello as u8, 0x20);
+        assert_eq!(MessageType::VersionAck as u8, 0x21);
     }
 
     #[test]

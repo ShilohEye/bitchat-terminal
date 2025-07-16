@@ -1,7 +1,7 @@
-# Test-specific Dockerfile for bitchat-terminal with dependency caching
+# Dockerfile optimized for testing with better dependency caching
 FROM rust:1.85-bookworm
 
-# Install build dependencies for Bluetooth Low Energy support and testing
+# Install build dependencies for Bluetooth Low Energy support
 RUN apt-get update && apt-get install -y \
     pkg-config \
     libdbus-1-dev \
@@ -12,20 +12,24 @@ RUN apt-get update && apt-get install -y \
 # Set working directory
 WORKDIR /app
 
-# Copy dependency files first for caching
+# Copy only Cargo.toml and Cargo.lock first for dependency caching
 COPY Cargo.toml ./
 
-# Create a dummy main.rs to satisfy cargo build
+# Create a dummy main.rs to satisfy cargo build for dependency compilation
 RUN mkdir src && echo "fn main() {}" > src/main.rs
 
-# Build dependencies (this layer will be cached)
-RUN cargo build --release && rm -rf src target/release/deps/bitchat*
+# Build dependencies only (this layer will be cached unless Cargo.toml changes)
+RUN cargo build && rm -rf src/
 
-# Copy actual source code
-COPY src ./src
+# Copy the actual source code
+COPY src/ ./src/
 
-# Set RUSTFLAGS to suppress dead_code warnings during tests
-ENV RUSTFLAGS="-A dead_code"
+# Build the actual application (only this layer rebuilds when code changes)
+RUN cargo build
 
-# Run tests by default
-CMD ["cargo", "test", "--release"]
+# Set environment for testing
+ENV RUST_LOG=debug
+ENV RUST_BACKTRACE=1
+
+# Default command runs tests
+CMD ["cargo", "test", "--", "--nocapture"]
