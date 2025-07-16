@@ -414,11 +414,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut app_state = load_state();
     let mut nickname = app_state.nickname.clone().unwrap_or_else(|| "my-rust-client".to_string());
 
-    // Create Noise encryption service
-    let noise_service = Arc::new(NoiseIntegrationService::new().map_err(|e| {
-        eprintln!("Failed to initialize Noise service: {}", e);
-        std::io::Error::new(std::io::ErrorKind::Other, e)
-    })?);
+    // Create Noise encryption service with Ed25519 signing key
+    // Note: identity_key should always be present due to load_state() auto-generation
+    let noise_service = Arc::new(if let Some(ref identity_key) = app_state.identity_key {
+        NoiseIntegrationService::with_signing_key(identity_key).map_err(|e| {
+            eprintln!("Failed to initialize Noise service with signing key: {}", e);
+            std::io::Error::new(std::io::ErrorKind::Other, e)
+        })?
+    } else {
+        eprintln!("Warning: No identity key found - this should not happen!");
+        NoiseIntegrationService::new().map_err(|e| {
+            eprintln!("Failed to initialize Noise service: {}", e);
+            std::io::Error::new(std::io::ErrorKind::Other, e)
+        })?
+    });
 
     // All encryption now handled by Noise protocol
 
@@ -1725,11 +1734,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 debug_println!("[MESSAGE] Message content: '{}'", line);
                 debug_println!("[MESSAGE] Message payload size: {} bytes", message_payload.len());
                 
-                // Sign the message payload
-                let signature = noise_service.sign(&message_payload);
-                
-                // Create the complete message packet with signature
-                let message_packet = create_bitchat_packet_with_signature(&my_peer_id, MessageType::Message, message_payload.clone(), Some(signature));
+                // Create the complete message packet (unsigned for broadcast messages to match Swift protocol)
+                let message_packet = create_bitchat_packet(&my_peer_id, MessageType::Message, message_payload.clone());
                 
                 // Check if we need to fragment the COMPLETE PACKET (matching Swift behavior)
                 if should_fragment(&message_packet) {
