@@ -1,5 +1,56 @@
 use std::collections::HashMap;
+use std::str::FromStr;
 use chrono::{DateTime, Local};
+use cdk::nuts::Token;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+fn decode_cashu_token(token_str: &str) -> Option<String> {
+    // Remove the cashu: prefix if present
+    let token_without_prefix = if token_str.starts_with("cashu:") {
+        &token_str[6..]
+    } else {
+        token_str
+    };
+    
+    // Try to decode the token
+    match Token::from_str(token_without_prefix) {
+        Ok(token) => {
+            // Get token amount using the value() method which doesn't require keysets
+            let token_amount = match token.value() {
+                Ok(amount) => amount.to_string(),
+                Err(_) => "unknown".to_string(),
+            };
+            
+            // Get mint URL
+            let mint_url = match token.mint_url() {
+                Ok(url) => url.to_string(),
+                Err(_) => "unknown mint".to_string(),
+            };
+            
+            // Get token version info
+            let version = match &token {
+                Token::TokenV3(_) => "v3",
+                Token::TokenV4(_) => "v4",
+            };
+            
+            // Get memo if available
+            let memo_text = match token.memo() {
+                Some(memo) => format!(" ({})", memo),
+                None => String::new(),
+            };
+            
+            // Get unit
+            let unit = match token.unit() {
+                Some(unit) => format!("{:?}", unit).to_lowercase(),
+                None => "sat".to_string(),
+            };
+            
+            Some(format!("🎫 Cashu Token {}: {} {} from {}{}", 
+                version, token_amount, unit, mint_url, memo_text))
+        }
+        Err(_) => None, // Not a valid cashu token
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum ChatMode {
@@ -8,7 +59,7 @@ pub enum ChatMode {
     PrivateDM { nickname: String, peer_id: String },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ChatContext {
     pub current_mode: ChatMode,
     pub active_channels: Vec<String>,
@@ -211,6 +262,409 @@ impl ChatContext {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ClaimableToken {
+    pub id: String,
+    pub token: String,
+    pub amount: u64,
+    pub unit: String,
+    pub mint_url: String,
+    pub created_at: u64,
+    pub expires_at: u64,
+}
+
+#[derive(Debug)]
+pub struct ClaimableTokenManager {
+    tokens: HashMap<String, ClaimableToken>,
+}
+
+impl ClaimableTokenManager {
+    pub fn new() -> Self {
+        Self {
+            tokens: HashMap::new(),
+        }
+    }
+
+    pub fn generate_token_id() -> String {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        format!("{:04}", rng.gen_range(1000..10000))
+    }
+
+    pub fn add_token(&mut self, token: String, amount: u64, unit: String, mint_url: String) -> String {
+        let id = Self::generate_token_id();
+        let current_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        
+        let claimable = ClaimableToken {
+            id: id.clone(),
+            token,
+            amount,
+            unit,
+            mint_url,
+            created_at: current_time,
+            expires_at: current_time + 3600, // 1 hour expiry
+        };
+
+        self.tokens.insert(id.clone(), claimable);
+        id
+    }
+
+    pub fn claim_token(&mut self, id: &str) -> Option<String> {
+        let current_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        if let Some(claimable) = self.tokens.get(id) {
+            if current_time > claimable.expires_at {
+                self.tokens.remove(id);
+                return None; // Token expired
+            }
+            
+            let token = claimable.token.clone();
+            self.tokens.remove(id);
+            Some(token)
+        } else {
+            None
+        }
+    }
+
+    pub fn cleanup_expired(&mut self) {
+        let current_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        self.tokens.retain(|_, token| current_time <= token.expires_at);
+    }
+
+    pub fn list_active_tokens(&self) -> Vec<(String, &ClaimableToken)> {
+        let current_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        self.tokens
+            .iter()
+            .filter(|(_, token)| current_time <= token.expires_at)
+            .map(|(id, token)| (id.clone(), token))
+            .collect()
+    }
+}
+
+pub fn print_ascii_token(id: &str, amount: u64, unit: &str, mint_url: &str) {
+    println!("\n\x1b[33m╔═══════════════════════════════════════╗\x1b[0m");
+    println!("\x1b[33m║\x1b[0m           \x1b[36m💰 CASHU TOKEN DROP\x1b[0m           \x1b[33m║\x1b[0m");
+    println!("\x1b[33m╠═══════════════════════════════════════╣\x1b[0m");
+    println!("\x1b[33m║\x1b[0m                                       \x1b[33m║\x1b[0m");
+    println!("\x1b[33m║\x1b[0m    \x1b[32m┌─────────────────────────────┐\x1b[0m    \x1b[33m║\x1b[0m");
+    
+    // Format token ID with proper padding
+    let token_line = format!("     TOKEN ID: {}     ", id);
+    let padding = if token_line.len() < 29 {
+        " ".repeat((29 - token_line.len()) / 2)
+    } else {
+        "".to_string()
+    };
+    let right_padding = if token_line.len() < 29 {
+        " ".repeat(29 - token_line.len() - padding.len())
+    } else {
+        "".to_string()
+    };
+    
+    println!("\x1b[33m║\x1b[0m    \x1b[32m│\x1b[0m{}\x1b[93m{}\x1b[0m{}\x1b[32m│\x1b[0m    \x1b[33m║\x1b[0m", padding, token_line.trim(), right_padding);
+    println!("\x1b[33m║\x1b[0m    \x1b[32m└─────────────────────────────┘\x1b[0m    \x1b[33m║\x1b[0m");
+    println!("\x1b[33m║\x1b[0m                                       \x1b[33m║\x1b[0m");
+    
+    // Format amount with proper padding
+    let amount_line = format!("Amount: {} {}", amount, unit);
+    let amount_padding = if amount_line.len() < 37 {
+        " ".repeat((37 - amount_line.len()) / 2)
+    } else {
+        "".to_string()
+    };
+    let amount_right_padding = if amount_line.len() < 37 {
+        " ".repeat(37 - amount_line.len() - amount_padding.len())
+    } else {
+        "".to_string()
+    };
+    
+    println!("\x1b[33m║\x1b[0m{}\x1b[92m{}\x1b[0m{}\x1b[33m║\x1b[0m", amount_padding, amount_line, amount_right_padding);
+    
+    // Truncate mint URL if too long and format with proper padding
+    let display_mint = if mint_url.len() > 30 {
+        format!("{}...", &mint_url[..27])
+    } else {
+        mint_url.to_string()
+    };
+    let mint_line = format!("Mint: {}", display_mint);
+    let mint_padding = if mint_line.len() < 37 {
+        " ".repeat((37 - mint_line.len()) / 2)
+    } else {
+        "".to_string()
+    };
+    let mint_right_padding = if mint_line.len() < 37 {
+        " ".repeat(37 - mint_line.len() - mint_padding.len())
+    } else {
+        "".to_string()
+    };
+    
+    println!("\x1b[33m║\x1b[0m{}\x1b[90m{}\x1b[0m{}\x1b[33m║\x1b[0m", mint_padding, mint_line, mint_right_padding);
+    
+    println!("\x1b[33m║\x1b[0m                                       \x1b[33m║\x1b[0m");
+    
+    // Format claim instruction with proper padding
+    let claim_line = format!("Type: /claim {} to claim this token!", id);
+    let claim_padding = if claim_line.len() < 37 {
+        " ".repeat((37 - claim_line.len()) / 2)
+    } else {
+        "".to_string()
+    };
+    let claim_right_padding = if claim_line.len() < 37 {
+        " ".repeat(37 - claim_line.len() - claim_padding.len())
+    } else {
+        "".to_string()
+    };
+    
+    println!("\x1b[33m║\x1b[0m{}\x1b[96m{}\x1b[0m{}\x1b[33m║\x1b[0m", claim_padding, claim_line, claim_right_padding);
+    println!("\x1b[33m║\x1b[0m                                       \x1b[33m║\x1b[0m");
+    println!("\x1b[33m║\x1b[0m           \x1b[91m⏰ Expires in 1 hour\x1b[0m          \x1b[33m║\x1b[0m");
+    println!("\x1b[33m╚═══════════════════════════════════════╝\x1b[0m\n");
+}
+
+pub fn print_token_claimed(id: &str, amount: u64, unit: &str) {
+    println!("\n\x1b[32m╔═══════════════════════════════════════╗\x1b[0m");
+    println!("\x1b[32m║\x1b[0m           \x1b[93m🎉 TOKEN CLAIMED!\x1b[0m            \x1b[32m║\x1b[0m");
+    println!("\x1b[32m╠═══════════════════════════════════════╣\x1b[0m");
+    println!("\x1b[32m║\x1b[0m                                       \x1b[32m║\x1b[0m");
+    println!("\x1b[32m║\x1b[0m      You successfully claimed:         \x1b[32m║\x1b[0m");
+    println!("\x1b[32m║\x1b[0m                                       \x1b[32m║\x1b[0m");
+    
+    // Format token ID with proper padding
+    let token_id_line = format!("Token ID: {}", id);
+    let token_id_padding = if token_id_line.len() < 37 {
+        " ".repeat((37 - token_id_line.len()) / 2)
+    } else {
+        "".to_string()
+    };
+    let token_id_right_padding = if token_id_line.len() < 37 {
+        " ".repeat(37 - token_id_line.len() - token_id_padding.len())
+    } else {
+        "".to_string()
+    };
+    
+    println!("\x1b[32m║\x1b[0m{}\x1b[93m{}\x1b[0m{}\x1b[32m║\x1b[0m", token_id_padding, token_id_line, token_id_right_padding);
+    
+    // Format amount with proper padding
+    let amount_line = format!("Amount: {} {}", amount, unit);
+    let amount_padding = if amount_line.len() < 37 {
+        " ".repeat((37 - amount_line.len()) / 2)
+    } else {
+        "".to_string()
+    };
+    let amount_right_padding = if amount_line.len() < 37 {
+        " ".repeat(37 - amount_line.len() - amount_padding.len())
+    } else {
+        "".to_string()
+    };
+    
+    println!("\x1b[32m║\x1b[0m{}\x1b[92m{}\x1b[0m{}\x1b[32m║\x1b[0m", amount_padding, amount_line, amount_right_padding);
+    println!("\x1b[32m║\x1b[0m                                       \x1b[32m║\x1b[0m");
+    println!("\x1b[32m║\x1b[0m    The token has been added to your    \x1b[32m║\x1b[0m");
+    println!("\x1b[32m║\x1b[0m           Cashu wallet! 💰             \x1b[32m║\x1b[0m");
+    println!("\x1b[32m╚═══════════════════════════════════════╝\x1b[0m\n");
+}
+
+pub fn print_active_tokens(tokens: &[(String, &ClaimableToken)]) {
+    if tokens.is_empty() {
+        println!("\n\x1b[90m╔═══════════════════════════════════════╗\x1b[0m");
+        println!("\x1b[90m║\x1b[0m         \x1b[36m💰 CLAIMABLE TOKENS\x1b[0m          \x1b[90m║\x1b[0m");
+        println!("\x1b[90m╠═══════════════════════════════════════╣\x1b[0m");
+        println!("\x1b[90m║\x1b[0m                                       \x1b[90m║\x1b[0m");
+        println!("\x1b[90m║\x1b[0m        No tokens available to         \x1b[90m║\x1b[0m");
+        println!("\x1b[90m║\x1b[0m             claim right now           \x1b[90m║\x1b[0m");
+        println!("\x1b[90m║\x1b[0m                                       \x1b[90m║\x1b[0m");
+        println!("\x1b[90m╚═══════════════════════════════════════╝\x1b[0m\n");
+        return;
+    }
+
+    println!("\n\x1b[33m╔═══════════════════════════════════════╗\x1b[0m");
+    println!("\x1b[33m║\x1b[0m         \x1b[36m💰 CLAIMABLE TOKENS\x1b[0m          \x1b[33m║\x1b[0m");
+    println!("\x1b[33m╠═══════════════════════════════════════╣\x1b[0m");
+    
+    for (id, token) in tokens {
+        let current_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let time_left = if token.expires_at > current_time {
+            let mins_left = (token.expires_at - current_time) / 60;
+            if mins_left > 60 {
+                format!("{}h {}m", mins_left / 60, mins_left % 60)
+            } else {
+                format!("{}m", mins_left)
+            }
+        } else {
+            "Expired".to_string()
+        };
+
+        println!("\x1b[33m║\x1b[0m                                       \x1b[33m║\x1b[0m");
+        
+        // Format token line with proper spacing
+        let token_info = format!("ID: {}  {} {}  ({})", id, token.amount, token.unit, time_left);
+        let token_padding = if token_info.len() < 37 {
+            " ".repeat((37 - token_info.len()) / 2)
+        } else {
+            "".to_string()
+        };
+        let token_right_padding = if token_info.len() < 37 {
+            " ".repeat(37 - token_info.len() - token_padding.len())
+        } else {
+            "".to_string()
+        };
+        
+        println!("\x1b[33m║\x1b[0m{}\x1b[93mID: {}\x1b[0m  \x1b[92m{} {}\x1b[0m  \x1b[91m({})\x1b[0m{}\x1b[33m║\x1b[0m", 
+            token_padding, id, token.amount, token.unit, time_left, token_right_padding);
+    }
+    
+    println!("\x1b[33m║\x1b[0m                                       \x1b[33m║\x1b[0m");
+    println!("\x1b[33m║\x1b[0m      \x1b[96mUse /claim <ID> to claim\x1b[0m        \x1b[33m║\x1b[0m");
+    println!("\x1b[33m╚═══════════════════════════════════════╝\x1b[0m\n");
+}
+
+// Helper function to extract token information from cashu token string
+fn extract_token_info(token_str: &str) -> Option<(u64, String, String)> {
+    // Remove the cashu: prefix if present
+    let token_without_prefix = if token_str.starts_with("cashu:") {
+        &token_str[6..]
+    } else {
+        token_str
+    };
+    
+    // Try to decode the token
+    match Token::from_str(token_without_prefix) {
+        Ok(token) => {
+            // Get token amount
+            let token_amount = match token.value() {
+                Ok(amount) => amount.into(),
+                Err(_) => return None,
+            };
+            
+            // Get mint URL
+            let mint_url = match token.mint_url() {
+                Ok(url) => url.to_string(),
+                Err(_) => "unknown mint".to_string(),
+            };
+            
+            // Get unit
+            let unit = match token.unit() {
+                Some(unit) => format!("{:?}", unit).to_lowercase(),
+                None => "sat".to_string(),
+            };
+            
+            Some((token_amount, unit, mint_url))
+        }
+        Err(_) => None,
+    }
+}
+
+// New version of format_message_display that handles automatic token rendering
+pub fn format_message_display_with_tokens(
+    timestamp: DateTime<Local>,
+    sender: &str,
+    content: &str,
+    is_private: bool,
+    is_channel: bool,
+    channel_name: Option<&str>,
+    recipient: Option<&str>,
+    my_nickname: &str,
+    claimable_tokens: &mut ClaimableTokenManager,
+    sender_is_me: bool,
+) -> (String, bool) {
+    let time_str = timestamp.format("%H:%M").to_string();
+    
+    // Check if the content is a cashu token and handle it specially
+    let (display_content, token_processed) = if content.starts_with("cashu:") || content.starts_with("cashu") {
+        // Only process tokens from other users, not our own
+        if !sender_is_me {
+            if let Some((amount, unit, mint_url)) = extract_token_info(content) {
+                // Add token to claimable tokens manager
+                let token_id = claimable_tokens.add_token(
+                    content.to_string(),
+                    amount,
+                    unit.clone(),
+                    mint_url.clone()
+                );
+                
+                // Print the ASCII art token immediately
+                print_ascii_token(&token_id, amount, &unit, &mint_url);
+                
+                // Return a simple message indicating a token was dropped
+                let token_message = format!("💰 Dropped a {} {} Cashu token! (ID: {})", amount, unit, token_id);
+                (token_message, true)
+            } else {
+                // Failed to parse, show as regular message
+                (content.to_string(), false)
+            }
+        } else {
+            // Our own token - show the decoded version but don't make it claimable
+            if let Some(decoded) = decode_cashu_token(content) {
+                (decoded, false)
+            } else {
+                (content.to_string(), false)
+            }
+        }
+    } else {
+        (content.to_string(), false)
+    };
+    
+    let formatted_message = if is_private {
+        // Use orange for private messages (matching iOS)
+        if sender == my_nickname {
+            // Message I sent - use brighter orange
+            if let Some(recipient) = recipient {
+                format!("\x1b[2;38;5;208m[{}|DM]\x1b[0m \x1b[38;5;214m<you → {}>\x1b[0m {}", time_str, recipient, display_content)
+            } else {
+                format!("\x1b[2;38;5;208m[{}|DM]\x1b[0m \x1b[38;5;214m<you → ???>\x1b[0m {}", time_str, display_content)
+            }
+        } else {
+            // Message I received - use normal orange
+            format!("\x1b[2;38;5;208m[{}|DM]\x1b[0m \x1b[38;5;208m<{} → you>\x1b[0m {}", time_str, sender, display_content)
+        }
+    } else if is_channel {
+        // Use blue for channel messages (matching iOS)
+        if sender == my_nickname {
+            // My messages - use light blue (256-color)
+            if let Some(channel) = channel_name {
+                format!("\x1b[2;34m[{}|{}]\x1b[0m \x1b[38;5;117m<{} @ {}>\x1b[0m {}", time_str, channel, sender, channel, display_content)
+            } else {
+                format!("\x1b[2;34m[{}|Ch]\x1b[0m \x1b[38;5;117m<{} @ ???>\x1b[0m {}", time_str, sender, display_content)
+            }
+        } else {
+            // Other users - use normal blue
+            if let Some(channel) = channel_name {
+                format!("\x1b[2;34m[{}|{}]\x1b[0m \x1b[34m<{} @ {}>\x1b[0m {}", time_str, channel, sender, channel, display_content)
+            } else {
+                format!("\x1b[2;34m[{}|Ch]\x1b[0m \x1b[34m<{} @ ???>\x1b[0m {}", time_str, sender, display_content)
+            }
+        }
+    } else {
+        // Public message - use green for metadata
+        if sender == my_nickname {
+            // My messages - use light green (256-color)
+            format!("\x1b[2;32m[{}]\x1b[0m \x1b[38;5;120m<{}>\x1b[0m {}", time_str, sender, display_content)
+        } else {
+            // Other users - use normal green
+            format!("\x1b[2;32m[{}]\x1b[0m \x1b[32m<{}>\x1b[0m {}", time_str, sender, display_content)
+        }
+    };
+
+    (formatted_message, token_processed)
+}
+
 pub fn format_message_display(
     timestamp: DateTime<Local>,
     sender: &str,
@@ -223,41 +677,52 @@ pub fn format_message_display(
 ) -> String {
     let time_str = timestamp.format("%H:%M").to_string();
     
+    // Check if the content is a cashu token and decode it if so
+    let display_content = if content.starts_with("cashu:") || content.starts_with("cashu") {
+        if let Some(decoded) = decode_cashu_token(content) {
+            decoded
+        } else {
+            content.to_string()
+        }
+    } else {
+        content.to_string()
+    };
+    
     if is_private {
         // Use orange for private messages (matching iOS)
         if sender == my_nickname {
             // Message I sent - use brighter orange
             if let Some(recipient) = recipient {
-                format!("\x1b[2;38;5;208m[{}|DM]\x1b[0m \x1b[38;5;214m<you → {}>\x1b[0m {}", time_str, recipient, content)
+                format!("\x1b[2;38;5;208m[{}|DM]\x1b[0m \x1b[38;5;214m<you → {}>\x1b[0m {}", time_str, recipient, display_content)
             } else {
-                format!("\x1b[2;38;5;208m[{}|DM]\x1b[0m \x1b[38;5;214m<you → ???>\x1b[0m {}", time_str, content)
+                format!("\x1b[2;38;5;208m[{}|DM]\x1b[0m \x1b[38;5;214m<you → ???>\x1b[0m {}", time_str, display_content)
             }
         } else {
             // Message I received - use normal orange
-            format!("\x1b[2;38;5;208m[{}|DM]\x1b[0m \x1b[38;5;208m<{} → you>\x1b[0m {}", time_str, sender, content)
+            format!("\x1b[2;38;5;208m[{}|DM]\x1b[0m \x1b[38;5;208m<{} → you>\x1b[0m {}", time_str, sender, display_content)
         }
     } else if is_channel {
         // Use blue for channel messages (matching iOS)
         if sender == my_nickname {
             // My messages - use light blue (256-color)
             if let Some(channel) = channel_name {
-                format!("\x1b[2;34m[{}|{}]\x1b[0m \x1b[38;5;117m<{} @ {}>\x1b[0m {}", time_str, channel, sender, channel, content)
+                format!("\x1b[2;34m[{}|{}]\x1b[0m \x1b[38;5;117m<{} @ {}>\x1b[0m {}", time_str, channel, sender, channel, display_content)
             } else {
-                format!("\x1b[2;34m[{}|Ch]\x1b[0m \x1b[38;5;117m<{} @ ???>\x1b[0m {}", time_str, sender, content)
+                format!("\x1b[2;34m[{}|Ch]\x1b[0m \x1b[38;5;117m<{} @ ???>\x1b[0m {}", time_str, sender, display_content)
             }
         } else {
             // Other users - use normal blue
             if let Some(channel) = channel_name {
-                format!("\x1b[2;34m[{}|{}]\x1b[0m \x1b[34m<{} @ {}>\x1b[0m {}", time_str, channel, sender, channel, content)
+                format!("\x1b[2;34m[{}|{}]\x1b[0m \x1b[34m<{} @ {}>\x1b[0m {}", time_str, channel, sender, channel, display_content)
             } else {
-                format!("\x1b[2;34m[{}|Ch]\x1b[0m \x1b[34m<{} @ ???>\x1b[0m {}", time_str, sender, content)
+                format!("\x1b[2;34m[{}|Ch]\x1b[0m \x1b[34m<{} @ ???>\x1b[0m {}", time_str, sender, display_content)
             }
         }
     } else {
         // Public message - use green for metadata
         if sender == my_nickname {
             // My messages - use light green (256-color)
-            format!("\x1b[2;32m[{}]\x1b[0m \x1b[38;5;120m<{}>\x1b[0m {}", time_str, sender, content)
+            format!("\x1b[2;32m[{}]\x1b[0m \x1b[38;5;120m<{}>\x1b[0m {}", time_str, sender, display_content)
         } else {
             // Other users - use normal green
             format!("\x1b[2;32m[{}]\x1b[0m \x1b[32m<{}>\x1b[0m {}", time_str, sender, content)
@@ -302,13 +767,23 @@ pub fn print_help() {
     println!("\x1b[38;5;40m▶ Discovery\x1b[0m");
     println!("  \x1b[36m/channels\x1b[0m     List all discovered channels");
     println!("  \x1b[36m/online\x1b[0m       Show who's online");
-    println!("  \x1b[36m/w\x1b[0m            Alias for /online\n");
+    println!("  \x1b[36m/w\x1b[0m            Alias for /online");
+    println!("  \x1b[36m/peers\x1b[0m        Show peer encryption status\n");
     
     // Privacy & Security
     println!("\x1b[38;5;40m▶ Privacy & Security\x1b[0m");
     println!("  \x1b[36m/block\x1b[0m \x1b[90m@user\x1b[0m  Block a user");
     println!("  \x1b[36m/block\x1b[0m        List blocked users");
     println!("  \x1b[36m/unblock\x1b[0m \x1b[90m@user\x1b[0m Unblock a user\n");
+    
+    // Payments
+    println!("\x1b[38;5;40m▶ Payments\x1b[0m");
+    println!("  \x1b[36m/pay\x1b[0m \x1b[90m@user <amount>\x1b[0m Send Cashu payment via DM");
+    println!("  \x1b[36m/cashu_send\x1b[0m \x1b[90m<amount>\x1b[0m Send Cashu token to current chat");
+    println!("  \x1b[36m/wallet\x1b[0m \x1b[90m<command>\x1b[0m  Manage Cashu wallet");
+    println!("  \x1b[36m/drop\x1b[0m \x1b[90m<amount>\x1b[0m    Drop claimable token for others");
+    println!("  \x1b[36m/claim\x1b[0m \x1b[90m<id>\x1b[0m      Claim a dropped token by ID");
+    println!("  \x1b[36m/tokens\x1b[0m        List active claimable tokens\n");
     
     println!("\x1b[38;5;40m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\x1b[0m");
 }
@@ -339,4 +814,4 @@ impl ChatMode {
     pub fn is_private(&self) -> bool {
         matches!(self, ChatMode::PrivateDM { .. })
     }
-}
+} 
