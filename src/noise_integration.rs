@@ -364,15 +364,16 @@ impl NoiseIntegrationService {
         // Set key
         cipher.set(key);
 
-        // Prepare buffers for snow's API
-        let mut ciphertext = vec![0u8; data.len()];
-        let mut tag = vec![0u8; 16]; // ChaCha20-Poly1305 uses 16-byte tag
+        // Prepare buffer for snow's API - need extra space for the authentication tag
+        let mut ciphertext = vec![0u8; data.len() + 16]; // 16 bytes for ChaCha20-Poly1305 tag
 
         // Encrypt data using snow's API: encrypt(nonce: u64, authtext: &[u8], plaintext: &[u8], out: &mut [u8]) -> usize
         let nonce_u64 = u64::from_le_bytes(nonce[..8].try_into().unwrap());
-        let _tag_len = cipher.encrypt(nonce_u64, &[], data, &mut ciphertext);
+        let ciphertext_len = cipher.encrypt(nonce_u64, &[], data, &mut ciphertext);
 
-        // For ChaCha20-Poly1305, the tag is written to the end of the ciphertext buffer
+        // Truncate to actual ciphertext length (includes tag)
+        ciphertext.truncate(ciphertext_len);
+
         // Swift format: nonce (12 bytes) + ciphertext + tag (16 bytes)
         let mut result = Vec::with_capacity(12 + ciphertext.len());
         result.extend_from_slice(&nonce);
@@ -390,9 +391,7 @@ impl NoiseIntegrationService {
 
         // Extract components: nonce (12) + ciphertext + tag (16)
         let nonce = &data[0..12];
-        let ciphertext_len = data.len() - 12 - 16;
-        let ciphertext = &data[12..12 + ciphertext_len];
-        let tag = &data[12 + ciphertext_len..];
+        let ciphertext_with_tag = &data[12..]; // ciphertext + tag
 
         // Use snow's resolver to get ChaCha20-Poly1305 cipher
         let resolver = DefaultResolver;
@@ -402,12 +401,12 @@ impl NoiseIntegrationService {
         // Set key
         cipher.set(key);
 
-        // Prepare buffers for snow's API
-        let mut plaintext = vec![0u8; ciphertext.len()];
+        // Prepare buffer for snow's API
+        let mut plaintext = vec![0u8; ciphertext_with_tag.len()];
 
         // Decrypt data using snow's API: decrypt(nonce: u64, authtext: &[u8], ciphertext: &[u8], out: &mut [u8]) -> Result<usize, ()>
         let nonce_u64 = u64::from_le_bytes(nonce[..8].try_into().unwrap());
-        let result_len = cipher.decrypt(nonce_u64, &[], ciphertext, &mut plaintext)
+        let result_len = cipher.decrypt(nonce_u64, &[], ciphertext_with_tag, &mut plaintext)
             .map_err(|_| NoiseError::EncryptionError("Channel decryption failed".to_string()))?;
 
         // Resize to actual plaintext length

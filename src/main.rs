@@ -2814,6 +2814,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     if let Some(signature_bytes) = noise_service.sign(&identity_announce.public_key) {
                                         debug_println!("[IDENTITY] Identity signature verified for {}", identity_announce.peer_id);
                                         
+                                        // Check if this is a new peer
+                                        let is_new_peer = {
+                                            let peers_lock = peers.lock().unwrap();
+                                            !peers_lock.contains_key(&identity_announce.peer_id)
+                                        };
+                                        
                                         // Store peer information  
                                         {
                                             let mut peers_lock = peers.lock().unwrap();
@@ -2835,7 +2841,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             peers_lock.remove(previous_id);
                                         }
                                         
-                                        println!("🆔 Identity announced by {} ({})", identity_announce.nickname, identity_announce.peer_id);
+                                        // Show connection notification for new peers (matching old Announce behavior)
+                                        if is_new_peer {
+                                            // Clear any existing prompt and show connection notification in yellow
+                                            print!("\r\x1b[K\x1b[33m{} connected\x1b[0m\n> ", identity_announce.nickname);
+                                            std::io::stdout().flush().unwrap();
+                                        }
+                                        
+                                        debug_println!("[IDENTITY] Identity processed for {} ({})", identity_announce.nickname, identity_announce.peer_id);
                                     } else {
                                         debug_println!("[!] Failed to verify identity signature for {}", identity_announce.peer_id);
                                     }
@@ -3512,14 +3525,27 @@ fn parse_bitchat_packet(data: &[u8]) -> Result<BitchatPacket, &'static str> {
 
     // 7. Sender ID (8 bytes)
     let sender_id = data[offset..offset + SENDER_ID_SIZE].to_vec();
-    // Swift sends 8 ASCII bytes directly (e.g. "da213135")
-    let sender_id_str = String::from_utf8_lossy(&sender_id).trim_end_matches('\0').to_string();
+    // Convert raw bytes to hex string (matching Swift protocol)
+    // Remove trailing zeros (padding) and convert to hex
+    let trimmed_sender_id = sender_id.iter().take_while(|&&b| b != 0).copied().collect::<Vec<u8>>();
+    let sender_id_str = if trimmed_sender_id.is_empty() {
+        "00000000".to_string() // Fallback for all-zero IDs
+    } else {
+        hex::encode(&trimmed_sender_id)
+    };
     offset += SENDER_ID_SIZE;
 
     // 8. Recipient ID (8 bytes if hasRecipient flag set)
     let (recipient_id, recipient_id_str) = if has_recipient { 
         let recipient_id = data[offset..offset + RECIPIENT_ID_SIZE].to_vec();
-        let recipient_id_str = String::from_utf8_lossy(&recipient_id).trim_end_matches('\0').to_string();
+        // Handle both ASCII hex strings and raw bytes
+        let recipient_id_str = if recipient_id.iter().all(|&b| b.is_ascii_alphanumeric() || b == 0) {
+            // ASCII format
+            String::from_utf8_lossy(&recipient_id).trim_end_matches('\0').to_string()
+        } else {
+            // Raw bytes format - convert to hex
+            hex::encode(&recipient_id).trim_end_matches('0').to_string()
+        };
         debug_full_println!("[PACKET] Recipient ID raw bytes: {:?}", recipient_id);
         debug_full_println!("[PACKET] Recipient ID as string: '{}'", recipient_id_str);
         offset += RECIPIENT_ID_SIZE;
@@ -3624,29 +3650,44 @@ fn create_bitchat_packet_with_recipient(sender_id_str: &str, recipient_id_str: O
     debug_full_println!("[PACKET] Header: version={}, type=0x{:02X}, ttl={}, flags=0x{:02X}, payload_len={}", 
             version, msg_type_byte, ttl, flags, payload_length);
     
-    // 7. Sender ID (8 bytes) - Convert hex string to bytes, then use as ASCII
-    // If sender_id_str is a hex string like "04fbc83c", we store it as ASCII bytes
-    let mut sender_id_bytes = sender_id_str.as_bytes().to_vec();
+    // 7. Sender ID (8 bytes) - Convert hex string to raw bytes (matching Mac client)
+    let mut sender_id_bytes = if sender_id_str.len() % 2 == 0 && sender_id_str.chars().all(|c| c.is_ascii_hexdigit()) {
+        // Convert hex string to raw bytes
+        hex::decode(sender_id_str).unwrap_or_else(|_| sender_id_str.as_bytes().to_vec())
+    } else {
+        // Fallback to ASCII bytes if not valid hex
+        sender_id_str.as_bytes().to_vec()
+    };
+    
+    // Pad to 8 bytes with zeros
     if sender_id_bytes.len() < 8 {
         sender_id_bytes.resize(8, 0);
     } else if sender_id_bytes.len() > 8 {
         sender_id_bytes.truncate(8);
     }
     data.extend_from_slice(&sender_id_bytes);
-    debug_full_println!("[PACKET] Sender ID: {} -> {} bytes: {}", sender_id_str, sender_id_bytes.len(), hex::encode(&sender_id_bytes));
+    debug_full_println!("[PACKET] Sender ID: {} -> {} raw bytes: {}", sender_id_str, sender_id_bytes.len(), hex::encode(&sender_id_bytes));
     
     // 8. Recipient ID (8 bytes) - only if hasRecipient flag is set
     if has_recipient {
         if let Some(recipient) = recipient_id_str {
-            // Private message - use specific recipient
-            let mut recipient_bytes = recipient.as_bytes().to_vec();
+            // Private message - use specific recipient, convert hex to raw bytes
+            let mut recipient_bytes = if recipient.len() % 2 == 0 && recipient.chars().all(|c| c.is_ascii_hexdigit()) {
+                // Convert hex string to raw bytes
+                hex::decode(recipient).unwrap_or_else(|_| recipient.as_bytes().to_vec())
+            } else {
+                // Fallback to ASCII bytes if not valid hex
+                recipient.as_bytes().to_vec()
+            };
+            
+            // Pad to 8 bytes with zeros
             if recipient_bytes.len() < 8 {
                 recipient_bytes.resize(8, 0);
             } else if recipient_bytes.len() > 8 {
                 recipient_bytes.truncate(8);
             }
             data.extend_from_slice(&recipient_bytes);
-            debug_full_println!("[PACKET] Recipient ID (private): {} -> {} bytes: {}", recipient, recipient_bytes.len(), hex::encode(&recipient_bytes));
+            debug_full_println!("[PACKET] Recipient ID (private): {} -> {} raw bytes: {}", recipient, recipient_bytes.len(), hex::encode(&recipient_bytes));
         } else {
             // Broadcast message
             data.extend_from_slice(&BROADCAST_RECIPIENT);
@@ -4201,6 +4242,189 @@ mod tests {
         assert_eq!(deserialized.ack_id, "ack456");
         assert_eq!(deserialized.recipient_id, "recipient");
         assert_eq!(deserialized.hop_count, 2);
+    }
+
+    #[test]
+    fn test_rust_client_message_roundtrip() {
+        // Test that the Rust client can parse messages it sends itself
+        let sender_id = "a1b2c3d4"; // 8-character hex string
+        let test_message = "Hello, world!";
+        
+        // Create a message payload using the actual function
+        let nickname = "test-client";
+        let (payload, message_id) = create_bitchat_message_payload_full(nickname, test_message, None, false, sender_id);
+        
+        // Create the packet
+        let packet = create_bitchat_packet(sender_id, MessageType::Message, payload);
+        
+        // Parse the packet back
+        let parsed = parse_bitchat_packet(&packet).expect("Failed to parse packet");
+        
+        // Verify sender ID is correct
+        assert_eq!(parsed.sender_id_str, sender_id);
+        assert_eq!(parsed.msg_type, MessageType::Message);
+        
+        // Parse the message payload
+        let message = parse_bitchat_message_payload(&parsed.payload).expect("Failed to parse message payload");
+        
+        // Verify message content is correct
+        assert_eq!(message.content, test_message);
+        assert_eq!(message.id, message_id);
+        assert_eq!(message.channel, None);
+        assert_eq!(message.is_encrypted, false);
+    }
+
+    #[test]
+    fn test_channel_message_roundtrip() {
+        // Test unencrypted channel message roundtrip
+        let sender_id = "b1c2d3e4"; // 8-character hex string
+        let test_message = "Hello #general!";
+        let channel_name = "#general";
+        
+        // Create a channel message payload using the actual function
+        let nickname = "test-user";
+        let (payload, message_id) = create_bitchat_message_payload_full(nickname, test_message, Some(channel_name), false, sender_id);
+        
+        // Create the packet
+        let packet = create_bitchat_packet(sender_id, MessageType::Message, payload);
+        
+        // Parse the packet back
+        let parsed = parse_bitchat_packet(&packet).expect("Failed to parse packet");
+        
+        // Verify sender ID is correct
+        assert_eq!(parsed.sender_id_str, sender_id);
+        assert_eq!(parsed.msg_type, MessageType::Message);
+        
+        // Parse the message payload
+        let message = parse_bitchat_message_payload(&parsed.payload).expect("Failed to parse message payload");
+        
+        // Verify message content is correct
+        assert_eq!(message.content, test_message);
+        assert_eq!(message.id, message_id);
+        assert_eq!(message.channel, Some(channel_name.to_string()));
+        assert_eq!(message.is_encrypted, false);
+    }
+
+    #[test]
+    fn test_encrypted_channel_message_roundtrip() {
+        // Test encrypted channel message with correct and wrong passwords
+        let sender_id = "c1d2e3f4";
+        let test_message = "Secret message for #private";
+        let channel_name = "#private";
+        let correct_password = "test1234";
+        let wrong_password = "wrong1234";
+        let nickname = "test-user";
+        
+        // Create noise service for encryption
+        let noise_service = NoiseIntegrationService::new().expect("Failed to create noise service");
+        
+        // Create encrypted channel message payload
+        let correct_key = crate::noise_integration::NoiseIntegrationService::derive_channel_key(correct_password, channel_name);
+        let (payload, message_id) = create_encrypted_channel_message_payload(nickname, test_message, channel_name, &correct_key, &noise_service, sender_id);
+        
+        // Create the packet
+        let packet = create_bitchat_packet(sender_id, MessageType::Message, payload);
+        
+        // Parse the packet back
+        let parsed = parse_bitchat_packet(&packet).expect("Failed to parse packet");
+        
+        // Verify sender ID is correct
+        assert_eq!(parsed.sender_id_str, sender_id);
+        assert_eq!(parsed.msg_type, MessageType::Message);
+        
+        // Parse the message payload
+        let message = parse_bitchat_message_payload(&parsed.payload).expect("Failed to parse message payload");
+        
+        // Verify message is encrypted
+        assert_eq!(message.channel, Some(channel_name.to_string()));
+        assert_eq!(message.is_encrypted, true);
+        assert!(message.encrypted_content.is_some());
+        
+        // Test decryption with correct password
+        let correct_key = crate::noise_integration::NoiseIntegrationService::derive_channel_key(correct_password, channel_name);
+        if let Some(encrypted_data) = &message.encrypted_content {
+            let decrypted = noise_service.decrypt_with_channel_key(encrypted_data, &correct_key).expect("Failed to decrypt with correct password");
+            let decrypted_text = String::from_utf8(decrypted).expect("Failed to convert decrypted bytes to string");
+            assert_eq!(decrypted_text, test_message);
+        } else {
+            panic!("Expected encrypted content");
+        }
+        
+        // Test decryption with wrong password should fail
+        let wrong_key = crate::noise_integration::NoiseIntegrationService::derive_channel_key(wrong_password, channel_name);
+        if let Some(encrypted_data) = &message.encrypted_content {
+            let result = noise_service.decrypt_with_channel_key(encrypted_data, &wrong_key);
+            assert!(result.is_err(), "Decryption should fail with wrong password");
+        }
+    }
+
+    #[test]
+    fn test_noise_dm_roundtrip() {
+        // Test Noise-encrypted DM with correct and wrong keys
+        let sender_id = "d1e2f3a4";
+        let recipient_id = "a4f3e2d1";
+        let test_message = "Private DM message";
+        let nickname = "sender";
+        
+        // Create two noise services (sender and recipient)
+        let sender_noise = NoiseIntegrationService::new().expect("Failed to create sender noise service");
+        let recipient_noise = NoiseIntegrationService::new().expect("Failed to create recipient noise service");
+        let wrong_noise = NoiseIntegrationService::new().expect("Failed to create wrong noise service");
+        
+        // Get public keys
+        let sender_pubkey = sender_noise.get_static_public_key();
+        let recipient_pubkey = recipient_noise.get_static_public_key();
+        let wrong_pubkey = wrong_noise.get_static_public_key();
+        
+        // Store each other's public keys
+        sender_noise.store_peer_public_key(recipient_id, recipient_pubkey.clone());
+        recipient_noise.store_peer_public_key(sender_id, sender_pubkey.clone());
+        
+        // Establish sessions through handshake
+        let handshake_init = sender_noise.initiate_handshake(recipient_id).expect("Failed to initiate handshake");
+        let handshake_resp = recipient_noise.process_handshake_message(sender_id, &handshake_init).expect("Failed to process handshake init");
+        
+        if let Some(resp_data) = handshake_resp {
+            let handshake_final = sender_noise.process_handshake_message(recipient_id, &resp_data).expect("Failed to process handshake response");
+            
+            if let Some(final_data) = handshake_final {
+                recipient_noise.process_handshake_message(sender_id, &final_data).expect("Failed to process final handshake");
+            }
+        }
+        
+        // Create encrypted DM payload
+        let (payload, message_id) = create_bitchat_message_payload_full(nickname, test_message, None, true, sender_id);
+        
+        // Encrypt the payload for the recipient
+        let encrypted_payload = sender_noise.encrypt_for_peer(recipient_id, &payload).expect("Failed to encrypt DM");
+        
+        // Create the packet with NoiseEncrypted type
+        let packet = create_bitchat_packet_with_recipient(sender_id, Some(recipient_id), MessageType::NoiseEncrypted, encrypted_payload, None);
+        
+        // Parse the packet back
+        let parsed = parse_bitchat_packet(&packet).expect("Failed to parse packet");
+        
+        // Verify packet structure
+        assert_eq!(parsed.sender_id_str, sender_id);
+        assert_eq!(parsed.msg_type, MessageType::NoiseEncrypted);
+        assert_eq!(parsed.recipient_id_str, Some(recipient_id.to_string()));
+        
+        // Test decryption with correct recipient key
+        let decrypted_payload = recipient_noise.decrypt_from_peer(sender_id, &parsed.payload).expect("Failed to decrypt with correct key");
+        
+        // Parse the decrypted message
+        let message = parse_bitchat_message_payload(&decrypted_payload).expect("Failed to parse decrypted message");
+        
+        // Verify message content
+        assert_eq!(message.content, test_message);
+        assert_eq!(message.id, message_id);
+        assert_eq!(message.channel, None);
+        assert_eq!(message.is_encrypted, false);
+        
+        // Test decryption with wrong key should fail
+        wrong_noise.store_peer_public_key(sender_id, wrong_pubkey);
+        let wrong_result = wrong_noise.decrypt_from_peer(sender_id, &parsed.payload);
+        assert!(wrong_result.is_err(), "Decryption should fail with wrong noise key");
     }
 
     #[test]
