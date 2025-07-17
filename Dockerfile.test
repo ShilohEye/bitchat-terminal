@@ -1,0 +1,38 @@
+# Dockerfile optimized for testing with better dependency caching
+FROM rust:1.88-slim-trixie
+
+# Accept git hash as build argument
+ARG GIT_HASH=unknown
+
+# Install build dependencies for Bluetooth Low Energy support
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libdbus-1-dev \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set working directory
+WORKDIR /app
+
+# Copy only Cargo.toml and Cargo.lock first for dependency caching
+COPY Cargo.toml ./
+
+# Create a dummy main.rs to satisfy cargo build for dependency compilation
+RUN mkdir src && echo "fn main() {}" > src/main.rs
+
+# Build dependencies only (this layer will be cached unless Cargo.toml changes)
+RUN cargo build && rm -rf src/
+
+# Copy the actual source code
+COPY src/ ./src/
+
+# Build the actual application with git hash (only this layer rebuilds when code changes)
+RUN echo "Building with git hash: $GIT_HASH" && \
+    GIT_HASH=$GIT_HASH cargo build 
+
+# Set environment for testing
+ENV RUST_LOG=debug
+ENV RUST_BACKTRACE=1
+
+# Default command runs tests
+CMD ["cargo", "test", "--", "--nocapture"]

@@ -1,10 +1,9 @@
 use rand::Rng;
 
-// Match Swift's fragment size limit: 500 bytes per fragment
-// This aligns with Swift's maxFragmentSize configuration
+// This ensures fragments + headers stay under 512 byte block size
 // BLE 5.0 supports up to 512 bytes MTU on iOS
 #[allow(dead_code)]
-const MAX_FRAGMENT_SIZE: usize = 500;  // Match Swift implementation
+const MAX_FRAGMENT_SIZE: usize = 460;  // Reduced to fit within 512 byte blocks
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy)]
