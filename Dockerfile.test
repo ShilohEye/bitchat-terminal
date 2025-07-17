@@ -1,5 +1,5 @@
 # Dockerfile optimized for testing with better dependency caching
-FROM rust:1.85-bookworm
+FROM rust:1.88-slim-trixie
 
 # Accept git hash as build argument
 ARG GIT_HASH=unknown
@@ -8,8 +8,7 @@ ARG GIT_HASH=unknown
 RUN apt-get update && apt-get install -y \
     pkg-config \
     libdbus-1-dev \
-    libbluetooth-dev \
-    build-essential \
+    libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
@@ -29,7 +28,7 @@ COPY src/ ./src/
 
 # Build the actual application with git hash (only this layer rebuilds when code changes)
 RUN echo "Building with git hash: $GIT_HASH" && \
-    GIT_HASH=$GIT_HASH cargo build
+    GIT_HASH=$GIT_HASH cargo build 
 
 # Set environment for testing
 ENV RUST_LOG=debug

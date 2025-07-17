@@ -41,6 +41,63 @@ impl std::fmt::Display for NoiseError {
 
 impl std::error::Error for NoiseError {}
 
+/// Debug helper function to analyze handshake message structure
+pub fn debug_handshake_message(message: &[u8], stage: &str) {
+    println!("[HANDSHAKE_DEBUG] {} - Message length: {} bytes", stage, message.len());
+    if !message.is_empty() {
+        println!("[HANDSHAKE_DEBUG] {} - First 32 bytes: {:02x?}", stage, &message[..std::cmp::min(32, message.len())]);
+        println!("[HANDSHAKE_DEBUG] {} - Last 32 bytes: {:02x?}", stage, &message[std::cmp::max(0, message.len() - 32)..]);
+    }
+    
+    // XX handshake message expectations:
+    match message.len() {
+        32 => println!("[HANDSHAKE_DEBUG] {} - Message 1: Ephemeral public key (32 bytes) ✓", stage),
+        96 => println!("[HANDSHAKE_DEBUG] {} - Message 2: Ephemeral + Static + Tag (32+32+32 bytes) ✓", stage),
+        64 => println!("[HANDSHAKE_DEBUG] {} - Message 3: Static + Tag (32+32 bytes) ✓", stage),
+        _ => println!("[HANDSHAKE_DEBUG] {} - Unexpected message size for XX handshake", stage),
+    }
+}
+
+/// Analyze potential issues with a 96-byte handshake message (message 2 in XX)
+pub fn analyze_xx_message2(message: &[u8]) -> String {
+    if message.len() != 96 {
+        return format!("Expected 96 bytes for XX message 2, got {}", message.len());
+    }
+    
+    let ephemeral_pubkey = &message[0..32];
+    let encrypted_static = &message[32..64];
+    let auth_tag = &message[64..96];
+    
+    // Check if ephemeral key looks valid (not all zeros, not all 0xFF)
+    let all_zeros = ephemeral_pubkey.iter().all(|&b| b == 0);
+    let all_ones = ephemeral_pubkey.iter().all(|&b| b == 0xFF);
+    
+    if all_zeros {
+        return "Ephemeral public key is all zeros - invalid".to_string();
+    }
+    if all_ones {
+        return "Ephemeral public key is all 0xFF - invalid".to_string();
+    }
+    
+    // Check if it has the correct curve25519 structure (high bit should be cleared)
+    if ephemeral_pubkey[31] & 0x80 != 0 {
+        return "Ephemeral public key has invalid high bit set".to_string();
+    }
+    
+    // Basic entropy check - if the message has very low entropy, it might be corrupted
+    let mut byte_counts = [0u16; 256];
+    for &byte in message {
+        byte_counts[byte as usize] += 1;
+    }
+    let max_count = *byte_counts.iter().max().unwrap();
+    if max_count > 20 {  // If any byte appears more than 20 times in 96 bytes
+        return format!("Low entropy in message - byte 0x{:02x} appears {} times", 
+                      byte_counts.iter().position(|&c| c == max_count).unwrap(), max_count);
+    }
+    
+    "Message structure appears valid".to_string()
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum NoiseSessionState {
     Uninitialized,
@@ -73,6 +130,11 @@ pub struct NoiseSession {
 
 impl NoiseSession {
     pub fn new(peer_id: String, role: NoiseRole, local_static_key: &[u8]) -> Result<Self, NoiseError> {
+        // Ensure we have exactly 32 bytes for Curve25519 (matching Swift's CryptoKit format)
+        if local_static_key.len() != 32 {
+            return Err(NoiseError::HandshakeError(format!("Static key must be exactly 32 bytes, got {}", local_static_key.len())));
+        }
+        
         let params: NoiseParams = NOISE_PATTERN.parse()
             .map_err(|e| NoiseError::HandshakeError(format!("Invalid noise params: {}", e)))?;
         
@@ -131,10 +193,27 @@ impl NoiseSession {
             return Err(NoiseError::HandshakeError("Invalid session state".to_string()));
         }
 
+        // Debug the incoming message
+        debug_handshake_message(message, &format!("Processing message for {}", self.peer_id));
+        
+        // Extra analysis for 96-byte messages (XX message 2)
+        if message.len() == 96 {
+            let analysis = analyze_xx_message2(message);
+            println!("[HANDSHAKE_DEBUG] Message analysis: {}", analysis);
+        }
+
         if let Some(mut handshake) = self.handshake.take() {
             let mut payload = vec![0u8; 1024];
-            let _len = handshake.read_message(message, &mut payload)
-                .map_err(|e| NoiseError::HandshakeError(format!("Failed to read handshake message: {}", e)))?;
+            let len = handshake.read_message(message, &mut payload)
+                .map_err(|e| {
+                    println!("[HANDSHAKE_DEBUG] Snow error details: {:?}", e);
+                    println!("[HANDSHAKE_DEBUG] Handshake state info - is_initiator: {}", handshake.is_initiator());
+                    if let Ok(pattern) = handshake.get_handshake_hash() {
+                        println!("[HANDSHAKE_DEBUG] Handshake hash: {:02x?}", &pattern[..16]);
+                    }
+                    NoiseError::HandshakeError(format!("Failed to read handshake message: {}", e))
+                })?;
+            payload.truncate(len);  // Only keep the actual decrypted bytes
 
             // Check if handshake is complete
             if handshake.is_handshake_finished() {
@@ -248,22 +327,23 @@ pub struct NoiseSessionManager {
 
 impl NoiseSessionManager {
     pub fn new() -> Result<Self, NoiseError> {
-        // Generate static key pair
+        // Generate exactly 32-byte Curve25519 static key (matching Swift's CryptoKit format)
         let mut rng = rand::thread_rng();
         let mut local_static_key = vec![0u8; 32];
         rng.fill_bytes(&mut local_static_key);
         
-        // Calculate public key
-        let params: NoiseParams = NOISE_PATTERN.parse()
-            .map_err(|e| NoiseError::HandshakeError(format!("Invalid noise params: {}", e)))?;
-        let builder = Builder::new(params);
-        let keypair = builder.generate_keypair()
-            .map_err(|e| NoiseError::HandshakeError(format!("Failed to generate keypair: {}", e)))?;
+        // Derive public key using x25519-dalek (same as Swift's CryptoKit)
+        use x25519_dalek::{StaticSecret, PublicKey};
+        let mut key_bytes = [0u8; 32];
+        key_bytes.copy_from_slice(&local_static_key);
+        let secret = StaticSecret::from(key_bytes);
+        let public_key = PublicKey::from(&secret);
+        let local_public_key = public_key.as_bytes().to_vec();
         
         Ok(NoiseSessionManager {
             sessions: Arc::new(RwLock::new(HashMap::new())),
-            local_static_key: keypair.private.clone(),
-            local_public_key: keypair.public,
+            local_static_key,
+            local_public_key,
         })
     }
 
@@ -336,6 +416,9 @@ impl NoiseSessionManager {
     }
 
     pub fn handle_incoming_handshake(&self, peer_id: &str, message: &[u8]) -> Result<Option<Vec<u8>>, NoiseError> {
+        // Debug the incoming handshake
+        debug_handshake_message(message, &format!("Incoming handshake from {}", peer_id));
+        
         // Validate peer ID
         if peer_id.is_empty() || peer_id.len() > 64 {
             return Err(NoiseError::InvalidPeerID);

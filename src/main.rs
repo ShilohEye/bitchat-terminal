@@ -25,11 +25,6 @@ use std::env;
 
 use bloomfilter::Bloom;
 
-// use ed25519_dalek::SigningKey; // Removed: unused
-
-// use x25519_dalek::StaticSecret; // Removed: unused
-
-// use rand::rngs::OsRng; // Removed: unused
 use rand::Rng;
 use sha2::{Sha256, Digest};
 use serde::{Serialize, Deserialize, Deserializer};
@@ -94,6 +89,9 @@ const BITCHAT_CHARACTERISTIC_UUID: Uuid = Uuid::from_u128(0xA1B2C3D4_E5F6_4A5B_8
 // Cover traffic prefix used by iOS for dummy messages
 const COVER_TRAFFIC_PREFIX: &str = "☂DUMMY☂";
 
+// Block sizes for packet padding (matching Swift's MessagePadding.blockSizes)
+const BLOCK_SIZES: [usize; 4] = [256, 512, 1024, 2048];
+
 // Packet header flags
 const FLAG_HAS_RECIPIENT: u8 = 0x01;
 const FLAG_HAS_SIGNATURE: u8 = 0x02;
@@ -152,8 +150,25 @@ enum MessageType {
 }
 
 #[derive(Debug, Default, Clone)]
+struct Peer { 
+    nickname: Option<String>,
+    identity_binding: Option<PeerIdentityBinding>,
+}
 
-struct Peer { nickname: Option<String> }
+// Peer identity binding structure (matching Swift)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PeerIdentityBinding {
+    #[serde(rename = "currentPeerID")]
+    current_peer_id: String,
+    fingerprint: String,
+    #[serde(rename = "publicKey", deserialize_with = "deserialize_base64", serialize_with = "serialize_base64")]
+    public_key: Vec<u8>,
+    nickname: String,
+    #[serde(rename = "bindingTimestamp")]
+    binding_timestamp: f64,
+    #[serde(deserialize_with = "deserialize_base64", serialize_with = "serialize_base64")]
+    signature: Vec<u8>,
+}
 
 #[derive(Debug)]
 
@@ -511,11 +526,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _ = stdio::stdout().flush();
 
             if let Ok(Some(line)) = stdin.next_line().await {
-
                 if tx.send(line).await.is_err() { break; }
-
             } else { break; }
-
         }
 
     });
@@ -586,14 +598,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // TODO: Implement MTU negotiation
     // Swift calls: peripheral.maximumWriteValueLength(for: .withoutResponse)
     // Default BLE MTU is 23 bytes (20 data), extended can be up to 512
+    println!("[BLE] Note: Default BLE MTU is 23 bytes, extended can be up to 512");
 
 
     debug_println!("[3] Performing handshake...");
 
-    // Generate peer ID like Swift does (4 random bytes as hex)
-    let mut peer_id_bytes = [0u8; 4];
+    // Generate peer ID like Swift does (8 random bytes as hex = 16 char string)
+    let mut peer_id_bytes = [0u8; 8];
     rand::thread_rng().fill(&mut peer_id_bytes);
     let my_peer_id = hex::encode(&peer_id_bytes);
+    println!("[PEER_ID] Generated peer ID: {} (length: {})", my_peer_id, my_peer_id.len());
     debug_full_println!("[DEBUG] My peer ID: {}", my_peer_id);
     
     // Load persisted state early to get saved nickname
@@ -638,10 +652,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Add small delay before announcing
     time::sleep(Duration::from_millis(200)).await;
 
-    let announce_packet = create_bitchat_packet(&my_peer_id, MessageType::NoiseIdentityAnnounce, identity_payload);
+    // Send regular announce packet first (for backward compatibility with non-Noise clients)
+    let regular_announce_packet = create_bitchat_packet(&my_peer_id, MessageType::Announce, nickname.as_bytes().to_vec());
+    peripheral.write(cmd_char, &regular_announce_packet, WriteType::WithoutResponse).await?;
+    debug_println!("[ANNOUNCE] Sent regular announce for peer {} ({})", my_peer_id, nickname);
 
-    peripheral.write(cmd_char, &announce_packet, WriteType::WithoutResponse).await?;
-    
+    // Small delay between announcements
+    time::sleep(Duration::from_millis(100)).await;
+
+    // Then send Noise identity announcement (for Noise-capable clients)
+    let noise_announce_packet = create_bitchat_packet(&my_peer_id, MessageType::NoiseIdentityAnnounce, identity_payload);
+    peripheral.write(cmd_char, &noise_announce_packet, WriteType::WithoutResponse).await?;
     debug_println!("[IDENTITY] Sent NoiseIdentityAnnounce for peer {} ({})", my_peer_id, nickname);
 
     debug_println!("[3] Handshake sent. You can now chat.");
@@ -652,12 +673,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 
     let peers: Arc<Mutex<HashMap<String, Peer>>> = Arc::new(Mutex::new(HashMap::new()));
+    let peer_bindings: Arc<Mutex<HashMap<String, PeerIdentityBinding>>> = Arc::new(Mutex::new(HashMap::new()));
+    let fingerprint_to_peer_id: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+    let rotation_locked: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
 
     let mut bloom = Bloom::new_for_fp_rate(500, 0.01);
 
     let mut fragment_collector = FragmentCollector::new();
     let mut delivery_tracker = DeliveryTracker::new();
     let mut protocol_version_manager = ProtocolVersionManager::new();
+ 
 
     let mut chat_context = ChatContext::new();
     let mut channel_keys: HashMap<String, [u8; 32]> = HashMap::new();
@@ -685,7 +710,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-    // Note: We don't restore joined_channels as they need to be re-joined via announce
+
+    // 
+//Note: We don't restore joined_channels as they need to be re-joined via announce
     
     // Helper to create AppState for saving
     let create_app_state = |blocked: &HashSet<String>, 
@@ -710,11 +737,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 
     loop {
-
         tokio::select! {
 
             Some(line) = rx.recv() => {
-
                 // Handle number switching first
                 if line.len() == 1 {
                     if let Ok(num) = line.parse::<usize>() {
@@ -1144,12 +1169,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // Check if we have an established Noise session with the target peer
                         if noise_service.has_established_session(&target_peer_id) {
                             // Use Noise encryption for this peer
-                            match noise_service.encrypt_for_peer(&target_peer_id, &padded_payload) {
+                            // First create an inner BitchatPacket with the message (matching Swift)
+                            let inner_packet = create_bitchat_packet(
+                                &my_peer_id,
+                                MessageType::Message,
+                                padded_payload
+                            );
+                            
+                            // Encrypt the entire inner packet
+                            match noise_service.encrypt_for_peer(&target_peer_id, &inner_packet) {
                                 Ok(encrypted) => {
-                                    debug_println!("[NOISE] Encrypted private message: {} bytes", encrypted.len());
+                                    debug_println!("[NOISE] Encrypted private message packet: {} bytes", encrypted.len());
                                     
-                                    // Create packet with Noise encrypted message type
-                                    let packet = create_bitchat_packet_with_recipient(
+                                    // Create outer packet with Noise encrypted message type
+                                    let outer_packet = create_bitchat_packet_with_recipient(
                                         &my_peer_id,
                                         Some(&target_peer_id),
                                         MessageType::NoiseEncrypted,
@@ -1158,7 +1191,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     );
                                     
                                     // Send the private message
-                                    if let Err(_e) = send_packet_with_fragmentation(&peripheral, cmd_char, packet, &my_peer_id).await {
+                                    if let Err(_e) = send_packet_with_fragmentation(&peripheral, cmd_char, outer_packet, &my_peer_id).await {
                                         println!("\n\x1b[91m❌ Failed to send private message\x1b[0m");
                                         println!("\x1b[90mThe message could not be delivered. Connection may have been lost.\x1b[0m");
                                     } else {
@@ -1177,12 +1210,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 Ok(handshake_msg) => {
                                     debug_println!("[HANDSHAKE] Initiated handshake with {}, sending {} bytes", target_peer_id, handshake_msg.len());
                                     
+                                    // Debug: Print our static key info
+                                    let our_static_key = noise_service.get_static_public_key();
+                                    println!("[HANDSHAKE_DEBUG] Our static public key ({} bytes): {}", 
+                                        our_static_key.len(), 
+                                        hex::encode(&our_static_key));
+                                    
+                                    // Verify key length matches Swift's CryptoKit format
+                                    if our_static_key.len() != 32 {
+                                        println!("[HANDSHAKE_ERROR] Static key length {} != 32 bytes (Swift expects exactly 32)", our_static_key.len());
+                                    }
+                                    
+                                    // Debug: Print what we're sending
+                                    println!("[HANDSHAKE_DEBUG] Sending handshake init ({} bytes): {}", 
+                                        handshake_msg.len(), 
+                                        hex::encode(&handshake_msg));
+                                    
+                                    // Analyze handshake message structure (should be ~32 bytes ephemeral + 16 bytes payload)
+                                    if handshake_msg.len() >= 32 {
+                                        println!("[HANDSHAKE_DEBUG] Ephemeral key: {}", hex::encode(&handshake_msg[0..32]));
+                                        if handshake_msg.len() > 32 {
+                                            println!("[HANDSHAKE_DEBUG] Encrypted payload: {}", hex::encode(&handshake_msg[32..]));
+                                        }
+                                    }
+                                    
                                     // Create packet for handshake message
                                     let packet = create_bitchat_packet_with_recipient(
                                         &my_peer_id,
                                         Some(&target_peer_id),
                                         MessageType::NoiseHandshakeInit,
-                                        handshake_msg,
+                                        handshake_msg.clone(),
                                         None
                                     );
                                     
@@ -1837,12 +1894,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Check if we have an established Noise session with the target peer
                     if noise_service.has_established_session(target_peer_id) {
                         // Use Noise encryption for this peer
-                        match noise_service.encrypt_for_peer(target_peer_id, &padded_payload) {
+                        // First create an inner BitchatPacket with the message (matching Swift)
+                        let inner_packet = create_bitchat_packet(
+                            &my_peer_id,
+                            MessageType::Message,
+                            padded_payload
+                        );
+                        
+                        // Encrypt the entire inner packet
+                        match noise_service.encrypt_for_peer(target_peer_id, &inner_packet) {
                             Ok(encrypted) => {
-                                debug_println!("[NOISE] Encrypted private message: {} bytes", encrypted.len());
+                                debug_println!("[NOISE] Encrypted private message packet: {} bytes", encrypted.len());
                                 
-                                // Create packet with Noise encrypted message type
-                                let packet = create_bitchat_packet_with_recipient(
+                                // Create outer packet with Noise encrypted message type
+                                let outer_packet = create_bitchat_packet_with_recipient(
                                     &my_peer_id,
                                     Some(target_peer_id),
                                     MessageType::NoiseEncrypted,
@@ -1851,7 +1916,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 );
                                 
                                 // Send the private message
-                                if let Err(_e) = send_packet_with_fragmentation(&peripheral, cmd_char, packet, &my_peer_id).await {
+                                if let Err(_e) = send_packet_with_fragmentation(&peripheral, cmd_char, outer_packet, &my_peer_id).await {
                                     println!("\n\x1b[91m❌ Failed to send private message\x1b[0m");
                                     println!("\x1b[90mThe message could not be delivered. Connection may have been lost.\x1b[0m");
                                 } else {
@@ -1870,12 +1935,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             Ok(handshake_msg) => {
                                 debug_println!("[HANDSHAKE] Initiated handshake with {}, sending {} bytes", target_peer_id, handshake_msg.len());
                                 
+                                // Debug: Print our static key info
+                                let our_static_key = noise_service.get_static_public_key();
+                                println!("[HANDSHAKE_DEBUG] Our static public key ({} bytes): {}", 
+                                    our_static_key.len(), 
+                                    hex::encode(&our_static_key));
+                                
+                                // Debug: Print what we're sending
+                                println!("[HANDSHAKE_DEBUG] Sending handshake init ({} bytes): {}", 
+                                    handshake_msg.len(), 
+                                    hex::encode(&handshake_msg));
+                                
                                 // Create packet for handshake message
                                 let packet = create_bitchat_packet_with_recipient(
                                     &my_peer_id,
                                     Some(target_peer_id),
                                     MessageType::NoiseHandshakeInit,
-                                    handshake_msg,
+                                    handshake_msg.clone(),
                                     None
                                 );
                                 
@@ -1900,6 +1976,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 debug_println!("{} > {}", chat_context.format_prompt(), line);
                 
                 let current_channel = chat_context.current_mode.get_channel().map(|s| s.to_string());
+                debug_println!("[MESSAGE] Current channel: {:?}", current_channel);
                 
                 // Check if trying to send to password-protected channel without key
                 if let Some(ref channel) = current_channel {
@@ -1915,11 +1992,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         debug_println!("[ENCRYPT] Encrypting message for channel {} 🔒", channel);
                         create_encrypted_channel_message_payload(&nickname, &line, channel, channel_key, &noise_service, &my_peer_id)
                     } else {
-                        let payload = create_bitchat_message_payload(&nickname, &line, current_channel.as_deref());
+                        let payload = create_bitchat_message_payload(&nickname, &line, current_channel.as_deref(), &my_peer_id);
                         (payload, Uuid::new_v4().to_string()) // Generate ID for old style messages
                     }
                 } else {
-                    let payload = create_bitchat_message_payload(&nickname, &line, current_channel.as_deref());
+                    debug_println!("[MESSAGE] Creating public message (no channel)");
+                    let payload = create_bitchat_message_payload(&nickname, &line, current_channel.as_deref(), &my_peer_id);
+                    debug_println!("[MESSAGE] Created public message payload: {} bytes", payload.len());
+                    // Debug: print first 32 bytes of payload
+                    if payload.len() >= 32 {
+                        debug_println!("[MESSAGE] Payload first 32 bytes: {}", hex::encode(&payload[..32]));
+                    }
                     (payload, Uuid::new_v4().to_string()) // Generate ID for old style messages
                 };
                 
@@ -1932,35 +2015,109 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 debug_println!("[MESSAGE] Message payload size: {} bytes", message_payload.len());
                 
                 // Create the complete message packet (unsigned for broadcast messages to match Swift protocol)
+                debug_println!("[MESSAGE] Creating bitchat packet with payload size: {} bytes", message_payload.len());
                 let message_packet = create_bitchat_packet(&my_peer_id, MessageType::Message, message_payload.clone());
+                debug_println!("[MESSAGE] Created bitchat packet size: {} bytes", message_packet.len());
+                
+                // Parse and display our own packet for debugging (same format as received messages)
+                if let Ok(packet) = parse_bitchat_packet(&message_packet) {
+                    debug_full_println!("[DEBUG] ==================== MESSAGE BEING SENT ====================");
+                    debug_full_println!("[DEBUG] Sender: {}", packet.sender_id_str);
+                    debug_full_println!("[DEBUG] Recipient: {} (broadcast: {})", 
+                        packet.recipient_id_str.as_deref().unwrap_or("none"),
+                        packet.recipient_id.is_none() || packet.recipient_id.as_ref().map(|r| r == &BROADCAST_RECIPIENT).unwrap_or(false)
+                    );
+                    debug_full_println!("[DEBUG] Payload size: {} bytes", packet.payload.len());
+                    debug_full_println!("[DEBUG] Parsing message payload");
+                    
+                    // Parse the message payload
+                    if let Ok(message) = parse_bitchat_message_payload(&packet.payload) {
+                        debug_full_println!("[PARSE] Parsing message payload, size: {} bytes", packet.payload.len());
+                        if packet.payload.len() >= 32 {
+                            debug_full_println!("[PARSE] First 32 bytes hex: {}", hex::encode(&packet.payload[..32]));
+                        }
+                        let flags = packet.payload[0];
+                        debug_full_println!("[PARSE] Flags: 0x{:02X} (has_channel={}, is_private={}, is_encrypted={}, has_recipient_nickname={}, has_sender_peer_id={})", 
+                            flags, 
+                            (flags & MSG_FLAG_HAS_CHANNEL) != 0, 
+                            (flags & MSG_FLAG_IS_PRIVATE) != 0, 
+                            (flags & MSG_FLAG_IS_ENCRYPTED) != 0,
+                            (flags & MSG_FLAG_HAS_RECIPIENT_NICKNAME) != 0,
+                            (flags & MSG_FLAG_HAS_SENDER_PEER_ID) != 0);
+                        debug_full_println!("[PARSE] Timestamp: {} ms", message.timestamp);
+                        debug_full_println!("[DEBUG] Message parsed successfully!");
+                        debug_full_println!("[DEBUG] Message ID: {}", message.id);
+                        debug_full_println!("[DEBUG] Is encrypted channel: {}", message.is_encrypted);
+                        debug_full_println!("[DEBUG] Channel: {:?}", message.channel);
+                        debug_full_println!("[DEBUG] Content length: {} bytes", message.content.len());
+                    }
+                    debug_full_println!("[DEBUG] ===========================================================");
+                }
                 
                 // Check if we need to fragment the COMPLETE PACKET (matching Swift behavior)
                 if should_fragment(&message_packet) {
                     debug_println!("[MESSAGE] Complete packet ({} bytes) requires fragmentation", message_packet.len());
+                    debug_println!("[MESSAGE] Sending fragmented public message: {}", current_channel.is_none());
                     
                     // Use Swift-compatible fragmentation for complete packet
-                    if let Err(_e) = send_packet_with_fragmentation(&peripheral, cmd_char, message_packet, &my_peer_id).await {
+                    if let Err(e) = send_packet_with_fragmentation(&peripheral, cmd_char, message_packet, &my_peer_id).await {
                         println!("\n\x1b[91m❌ Message delivery failed\x1b[0m");
+                        println!("\x1b[90mError: {}\x1b[0m", e);
                         println!("\x1b[90mConnection lost. Please restart BitChat to reconnect.\x1b[0m");
                         break;
+                    } else {
+                        debug_println!("[MESSAGE] Fragmented message sent successfully");
                     }
                 } else {
                     // Send as single packet without fragmentation
                     debug_println!("[MESSAGE] Sending message as single packet ({} bytes)", message_packet.len());
                     
+                    // Pad packet to appropriate block size (matching Swift behavior)
+                    let original_size = message_packet.len();
+                    let padded_packet = pad_to_block_size(message_packet);
+                    
                     // Use WithResponse for larger packets (matching Swift's 512 byte threshold)
-                    let write_type = if message_packet.len() > 512 {
+                    let write_type = if padded_packet.len() > 512 {
                         WriteType::WithResponse
                     } else {
                         WriteType::WithoutResponse
                     };
                     
-                    if peripheral.write(cmd_char, &message_packet, write_type).await.is_err() {
-                        println!("[!] Failed to send message. Connection likely lost.");
-                        break;
+                    debug_println!("[MESSAGE] About to send packet via BLE, write_type: {:?}", write_type);
+                    debug_println!("[MESSAGE] Packet length: {} bytes (after padding), first 10 bytes: {:?}", 
+                        padded_packet.len(), 
+                        &padded_packet[..padded_packet.len().min(10)]);
+                    
+                    // Extra debug for public messages
+                    if current_channel.is_none() {
+                        println!("[PUBLIC_MSG_DEBUG] Sending public message packet:");
+                        println!("[PUBLIC_MSG_DEBUG] - Original size: {} bytes", original_size);
+                        println!("[PUBLIC_MSG_DEBUG] - Padded size: {} bytes", padded_packet.len());
+                        println!("[PUBLIC_MSG_DEBUG] - First 20 bytes hex: {}", hex::encode(&padded_packet[..padded_packet.len().min(20)]));
+                        println!("[PUBLIC_MSG_DEBUG] - Characteristic UUID: {:?}", cmd_char.uuid);
+                        println!("[PUBLIC_MSG_DEBUG] - Write type: {:?}", write_type);
                     }
                     
-                    debug_println!("[MESSAGE] ✓ Successfully sent message packet");
+                    let write_result = peripheral.write(cmd_char, &padded_packet, write_type).await;
+                    match write_result {
+                        Ok(_) => {
+                            debug_println!("[MESSAGE] ✓ Successfully sent message packet");
+                            debug_println!("[MESSAGE] Was public message: {}", current_channel.is_none());
+                            if current_channel.is_none() {
+                                println!("[PUBLIC_MSG_DEBUG] BLE write completed successfully for public message");
+                            }
+                        }
+                        Err(e) => {
+                            println!("[!] Failed to send message. Error: {:?}", e);
+                            println!("[!] Error details: {}", e);
+                            println!("[!] Error type: {}", std::any::type_name_of_val(&e));
+                            if current_channel.is_none() {
+                                println!("[PUBLIC_MSG_DEBUG] Failed to send PUBLIC message specifically");
+                            }
+                            println!("[!] Connection likely lost.");
+                            break;
+                        }
+                    }
                 }
                 debug_println!("[MESSAGE] ==================== MESSAGE SEND COMPLETE ====================");
                 
@@ -2481,9 +2638,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                      // Handshake complete (shouldn't happen on init, but handle gracefully)
                                      debug_println!("[+] Noise handshake completed with peer {}", packet.sender_id_str);
                                      
+                                     // Unlock rotation after successful handshake
+                                     unlock_rotation(&rotation_locked);
+                                     
                                      // Add peer to our known peers list if not already there
                                      if !peers_lock.contains_key(&packet.sender_id_str) {
-                                         peers_lock.insert(packet.sender_id_str.clone(), Peer { nickname: None });
+                                         peers_lock.insert(packet.sender_id_str.clone(), Peer { 
+                                            nickname: None,
+                                            identity_binding: None,
+                                        });
                                      }
                                  },
                                  Err(e) => {
@@ -2495,7 +2658,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                              // Handle Noise protocol handshake response
                              debug_println!("[<-- RECV] Noise handshake response from {} ({} bytes)", packet.sender_id_str, packet.payload.len());
                              
+                             // Debug: Print the raw handshake response data
+                             println!("[HANDSHAKE_DEBUG] Raw response payload ({} bytes): {}", 
+                                 packet.payload.len(), 
+                                 hex::encode(&packet.payload));
+                             // Print hex dump in 16-byte rows
+                            for (i, chunk) in packet.payload.chunks(16).enumerate() {
+                                let hex_part: String = chunk.iter()
+                                    .map(|b| format!("{:02X} ", b))
+                                    .collect();
+                                let ascii_part: String = chunk.iter()
+                                    .map(|&b| if b >= 0x20 && b < 0x7F { b as char } else { '.' })
+                                    .collect();
+                                println!("[HANDSHAKE_DEBUG] {:04X}: {:48} |{}|", 
+                                    i * 16, hex_part, ascii_part);
+                            }
+                            
+                            if packet.payload.len() > 0 {
+                                 println!("[HANDSHAKE_DEBUG] First byte: 0x{:02X}", packet.payload[0]);
+                                 // Check if it might be JSON
+                                 if packet.payload[0] == 0x7B { // '{' character
+                                     println!("[HANDSHAKE_DEBUG] Payload appears to be JSON");
+                                     if let Ok(json_str) = std::str::from_utf8(&packet.payload) {
+                                         println!("[HANDSHAKE_DEBUG] JSON content: {}", json_str);
+                                     }
+                                 }
+                             }
+                             
                              // Process the handshake response
+                             println!("[HANDSHAKE_DEBUG] Processing handshake response from {} ({} bytes)", 
+                                 packet.sender_id_str, packet.payload.len());
                              match noise_service.process_handshake_message(&packet.sender_id_str, &packet.payload) {
                                  Ok(Some(final_msg)) => {
                                      // Send final handshake message (if needed)
@@ -2515,13 +2707,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                      // Handshake complete
                                      debug_println!("[+] Noise handshake completed with peer {}", packet.sender_id_str);
                                      
+                                     // Unlock rotation after successful handshake
+                                     unlock_rotation(&rotation_locked);
+                                     
                                      // Add peer to our known peers list if not already there
                                      if !peers_lock.contains_key(&packet.sender_id_str) {
-                                         peers_lock.insert(packet.sender_id_str.clone(), Peer { nickname: None });
+                                         peers_lock.insert(packet.sender_id_str.clone(), Peer { 
+                                            nickname: None,
+                                            identity_binding: None,
+                                        });
                                      }
                                  },
                                  Err(e) => {
-                                     println!("[!] Failed to process Noise handshake response from {}: {}", packet.sender_id_str, e);
+                                     println!("[HANDSHAKE_ERROR] Failed to process handshake response from {}: {}", packet.sender_id_str, e);
+                                     println!("[HANDSHAKE_ERROR] Raw response payload: {}", hex::encode(&packet.payload));
+                                     
+                                     // Try to get more details about the error
+                                     println!("[HANDSHAKE_ERROR] Error details: {:?}", e);
                                  }
                              }
                          },
@@ -2827,58 +3029,135 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         
                         MessageType::NoiseIdentityAnnounce => {
                             // Handle Noise identity announcement
-                            debug_println!("[<-- RECV] Noise identity announce from {} ({} bytes)", packet.sender_id_str, packet.payload.len());
+                            let sender_id = packet.sender_id_str.clone();
+                            debug_println!("[<-- RECV] Noise identity announce from {} ({} bytes)", sender_id, packet.payload.len());
                             
-                            match serde_json::from_slice::<NoiseIdentityAnnouncement>(&packet.payload) {
-                                Ok(identity_announce) => {
-                                    debug_println!("[IDENTITY] Received announcement: peer_id={}, nickname={}, key_len={}", 
-                                        identity_announce.peer_id, identity_announce.nickname, identity_announce.public_key.len());
-                                    
-                                    // Verify signature (basic implementation)
-                                    if let Some(signature_bytes) = noise_service.sign(&identity_announce.public_key) {
-                                        debug_println!("[IDENTITY] Identity signature verified for {}", identity_announce.peer_id);
+                            // Release the peers lock before processing to avoid deadlock
+                            drop(peers_lock);
+                            
+                            if sender_id != my_peer_id && !is_peer_id_ours(&sender_id, &my_peer_id) {
+                                match serde_json::from_slice::<NoiseIdentityAnnouncement>(&packet.payload) {
+                                    Ok(announcement) => {
+                                        debug_println!("[IDENTITY] Received announcement: peer_id={}, nickname={}, key_len={}", 
+                                            announcement.peer_id, announcement.nickname, announcement.public_key.len());
                                         
-                                        // Check if this is a new peer
-                                        let is_new_peer = {
-                                            let peers_lock = peers.lock().unwrap();
-                                            !peers_lock.contains_key(&identity_announce.peer_id)
+                                        // Verify the signature (currently always returns true for compatibility)
+                                        let binding_data = {
+                                            let mut data = Vec::new();
+                                            data.extend_from_slice(announcement.peer_id.as_bytes());
+                                            data.extend_from_slice(&announcement.public_key);
+                                            data.extend_from_slice(&announcement.timestamp.to_ne_bytes());
+                                            data
                                         };
                                         
-                                        // Store peer information  
-                                        {
-                                            let mut peers_lock = peers.lock().unwrap();
-                                            peers_lock.insert(identity_announce.peer_id.clone(), Peer { 
-                                                nickname: Some(identity_announce.nickname.clone()) 
-                                            });
+                                        if !noise_service.verify_signature(&announcement.signature, &binding_data, &announcement.public_key) {
+                                            // Log but don't reject - signature verification is temporarily disabled
+                                            debug_println!("[SECURITY] Signature verification skipped for {}", sender_id);
                                         }
+                                        
+                                        // Calculate fingerprint from public key
+                                        let hash = sha2::Sha256::digest(&announcement.public_key);
+                                        let fingerprint = hex::encode(hash);
+                                        
+                                        // Create the binding
+                                        let binding = PeerIdentityBinding {
+                                            current_peer_id: announcement.peer_id.clone(),
+                                            fingerprint: fingerprint.clone(),
+                                            public_key: announcement.public_key.clone(),
+                                            nickname: announcement.nickname.clone(),
+                                            binding_timestamp: announcement.timestamp,
+                                            signature: announcement.signature.clone(),
+                                        };
+                                        
+                                        // Update our mappings
+                                        update_peer_binding(
+                                            &announcement.peer_id,
+                                            &fingerprint,
+                                            binding,
+                                            &peer_bindings,
+                                            &fingerprint_to_peer_id,
+                                            &peers,
+                                        );
+                                        
+                                        // Store peer information - need to re-acquire lock
+                                        let is_new_peer = {
+                                            let mut peers_lock = peers.lock().unwrap();
+                                            let is_new = !peers_lock.contains_key(&announcement.peer_id);
+                                            peers_lock.insert(announcement.peer_id.clone(), Peer { 
+                                                nickname: Some(announcement.nickname.clone()),
+                                                identity_binding: None, // Will be updated by update_peer_binding
+                                            });
+                                            
+                                            // Check if this is a peer ID rotation and handle it
+                                            if let Some(previous_id) = &announcement.previous_peer_id {
+                                                debug_println!("[IDENTITY] Peer {} rotated from previous ID {}", 
+                                                    announcement.peer_id, previous_id);
+                                                
+                                                // Remove old peer ID but keep the established session if any
+                                                peers_lock.remove(previous_id);
+                                            }
+                                            
+                                            is_new
+                                        }; // Lock released here
                                         
                                         // Store public key in noise service
-                                        noise_service.store_peer_public_key(&identity_announce.peer_id, identity_announce.public_key);
+                                        noise_service.store_peer_public_key(&announcement.peer_id, announcement.public_key.clone());
                                         
-                                        // If this is a peer ID rotation, handle previous peer ID
-                                        if let Some(previous_id) = &identity_announce.previous_peer_id {
-                                            debug_println!("[IDENTITY] Peer {} rotated from previous ID {}", 
-                                                identity_announce.peer_id, previous_id);
-                                            
-                                            // Remove old peer ID but keep the established session if any
-                                            let mut peers_lock = peers.lock().unwrap();
-                                            peers_lock.remove(previous_id);
-                                        }
+                                        // Register the peer's public key (in Swift this updates ChatViewModel)
+                                        // We just log it for now
+                                        debug_println!("[IDENTITY] Registered public key for peer {}", announcement.peer_id);
                                         
-                                        // Show connection notification for new peers (matching old Announce behavior)
+                                        // Show connection notification for new peers
                                         if is_new_peer {
                                             // Clear any existing prompt and show connection notification in yellow
-                                            print!("\r\x1b[K\x1b[33m{} connected\x1b[0m\n> ", identity_announce.nickname);
+                                            print!("\r\x1b[K\x1b[33m{} connected\x1b[0m\n> ", announcement.nickname);
                                             std::io::stdout().flush().unwrap();
                                         }
                                         
-                                        debug_println!("[IDENTITY] Identity processed for {} ({})", identity_announce.nickname, identity_announce.peer_id);
-                                    } else {
-                                        debug_println!("[!] Failed to verify identity signature for {}", identity_announce.peer_id);
+                                        // If we don't have a session yet, check if we should initiate
+                                        if !noise_service.has_established_session(&announcement.peer_id) {
+                                            // Lock rotation during handshake
+                                            lock_rotation(&rotation_locked);
+                                            
+                                            // Use lexicographic comparison as tie-breaker to prevent simultaneous handshakes
+                                            // Only the peer with the "lower" ID initiates
+                                            if my_peer_id < announcement.peer_id {
+                                                if let Err(e) = initiate_noise_handshake(
+                                                    &announcement.peer_id,
+                                                    &my_peer_id,
+                                                    &noise_service,
+                                                    &peripheral,
+                                                    &cmd_char,
+                                                ).await {
+                                                    eprintln!("[!] Failed to initiate handshake: {}", e);
+                                                }
+                                            } else {
+                                                // Send our identity back so they know we're ready
+                                                if let Err(e) = send_noise_identity_announce(
+                                                    &announcement.peer_id,
+                                                    &my_peer_id,
+                                                    &nickname,
+                                                    &noise_service,
+                                                    &peripheral,
+                                                    &cmd_char,
+                                                ).await {
+                                                    eprintln!("[!] Failed to send identity announce: {}", e);
+                                                }
+                                            }
+                                        } else {
+                                            // We already have a session, but ensure we have the public key data
+                                            // This handles the case where handshake completed before identity announcement
+                                            if let Some(public_key_data) = noise_service.get_peer_public_key_data(&announcement.peer_id) {
+                                                debug_println!("[IDENTITY] Already have session with {}, public key len: {}", 
+                                                    announcement.peer_id, public_key_data.len());
+                                            }
+                                        }
+                                        
+                                        debug_println!("[IDENTITY] Identity processed for {} ({})", announcement.nickname, announcement.peer_id);
+                                    },
+                                    Err(e) => {
+                                        debug_println!("[!] Failed to parse NoiseIdentityAnnouncement: {}", e);
                                     }
-                                },
-                                Err(e) => {
-                                    debug_println!("[!] Failed to parse NoiseIdentityAnnouncement: {}", e);
                                 }
                             }
                         },
@@ -3103,38 +3382,93 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 Ok(decrypted_data) => {
                                     debug_println!("[NOISE] Successfully decrypted message ({} bytes)", decrypted_data.len());
                                     
-                                    // Parse the decrypted data as a regular message
-                                    match parse_bitchat_message_payload(&decrypted_data) {
-                                        Ok(message) => {
-                                            if !bloom.check(&message.id) {
-                                                let sender_nick = peers_lock.get(&packet.sender_id_str)
-                                                    .and_then(|p| p.nickname.as_ref())
-                                                    .map_or(&packet.sender_id_str, |n| n);
-                                                
-                                                // Display the decrypted message as a private message
-                                                let timestamp = chrono::Local::now();
-                                                let display = format_message_display(
-                                                    timestamp,
-                                                    sender_nick,
-                                                    &message.content,
-                                                    true, // is_private
-                                                    false, // is_channel
-                                                    None, // channel
-                                                    Some(&nickname), // recipient for private messages
-                                                    &nickname // my_nickname
-                                                );
-                                                
-                                                print!("\r\x1b[K{}\n> ", display);
-                                                std::io::stdout().flush().unwrap();
-                                                
-                                                // Update chat context for reply functionality
-                                                chat_context.last_private_sender = Some((packet.sender_id_str.clone(), sender_nick.to_string()));
-                                                
-                                                bloom.set(&message.id);
+                                    // The decrypted data should be a complete BitchatPacket (matching Swift)
+                                    match parse_bitchat_packet(&decrypted_data) {
+                                        Ok(inner_packet) => {
+                                            debug_println!("[NOISE] Inner packet type: {:?}", inner_packet.msg_type);
+                                            
+                                            // Handle the inner packet based on its type
+                                            match inner_packet.msg_type {
+                                                MessageType::Message => {
+                                                    // Parse the message payload
+                                                    match parse_bitchat_message_payload(&inner_packet.payload) {
+                                                        Ok(message) => {
+                                                            if !bloom.check(&message.id) {
+                                                                let sender_nick = peers_lock.get(&packet.sender_id_str)
+                                                                    .and_then(|p| p.nickname.as_ref())
+                                                                    .map_or(&packet.sender_id_str, |n| n);
+                                                                
+                                                                // Display the decrypted message as a private message
+                                                                let timestamp = chrono::Local::now();
+                                                                let display = format_message_display(
+                                                                    timestamp,
+                                                                    sender_nick,
+                                                                    &message.content,
+                                                                    true, // is_private
+                                                                    false, // is_channel
+                                                                    None, // channel
+                                                                    Some(&nickname), // recipient for private messages
+                                                                    &nickname // my_nickname
+                                                                );
+                                                                
+                                                                print!("\r\x1b[K{}\n> ", display);
+                                                                std::io::stdout().flush().unwrap();
+                                                                
+                                                                // Update chat context for reply functionality
+                                                                chat_context.last_private_sender = Some((packet.sender_id_str.clone(), sender_nick.to_string()));
+                                                                
+                                                                bloom.set(&message.id);
+                                                            }
+                                                        },
+                                                        Err(e) => {
+                                                            debug_println!("[NOISE] Failed to parse inner message payload: {}", e);
+                                                        }
+                                                    }
+                                                },
+                                                // TODO: Handle other inner packet types (DeliveryAck, ReadReceipt, etc.)
+                                                _ => {
+                                                    debug_println!("[NOISE] Unhandled inner packet type: {:?}", inner_packet.msg_type);
+                                                }
                                             }
                                         },
                                         Err(e) => {
-                                            debug_println!("[NOISE] Failed to parse decrypted message: {}", e);
+                                            debug_println!("[NOISE] Failed to parse decrypted data as packet: {}", e);
+                                            
+                                            // Fallback: Try parsing as raw message payload for backwards compatibility
+                                            match parse_bitchat_message_payload(&decrypted_data) {
+                                                Ok(message) => {
+                                                    debug_println!("[NOISE] Fallback: parsed as raw message payload");
+                                                    if !bloom.check(&message.id) {
+                                                        let sender_nick = peers_lock.get(&packet.sender_id_str)
+                                                            .and_then(|p| p.nickname.as_ref())
+                                                            .map_or(&packet.sender_id_str, |n| n);
+                                                        
+                                                        // Display the decrypted message as a private message
+                                                        let timestamp = chrono::Local::now();
+                                                        let display = format_message_display(
+                                                            timestamp,
+                                                            sender_nick,
+                                                            &message.content,
+                                                            true, // is_private
+                                                            false, // is_channel
+                                                            None, // channel
+                                                            Some(&nickname), // recipient for private messages
+                                                            &nickname // my_nickname
+                                                        );
+                                                        
+                                                        print!("\r\x1b[K{}\n> ", display);
+                                                        std::io::stdout().flush().unwrap();
+                                                        
+                                                        // Update chat context for reply functionality
+                                                        chat_context.last_private_sender = Some((packet.sender_id_str.clone(), sender_nick.to_string()));
+                                                        
+                                                        bloom.set(&message.id);
+                                                    }
+                                                },
+                                                Err(e) => {
+                                                    debug_println!("[NOISE] Failed to parse decrypted message: {}", e);
+                                                }
+                                            }
                                         }
                                     }
                                 },
@@ -3153,11 +3487,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             },
-
-             _ = tokio::signal::ctrl_c() => { break; }
-
+            _ = tokio::signal::ctrl_c() => { break; }
         }
-
     }
 
 
@@ -3347,9 +3678,12 @@ fn parse_bitchat_message_payload(data: &[u8]) -> Result<BitchatMessage, &'static
 
 }
 
-fn create_bitchat_message_payload(sender: &str, content: &str, channel: Option<&str>) -> Vec<u8> {
+fn create_bitchat_message_payload(sender: &str, content: &str, channel: Option<&str>, sender_peer_id: &str) -> Vec<u8> {
+    debug_println!("[PAYLOAD] Creating message payload: sender={}, content_len={}, channel={:?}, peer_id={}", 
+        sender, content.len(), channel, sender_peer_id);
     // Use the complex format that iOS expects (when iOS was working)
-    let (payload, _) = create_bitchat_message_payload_full(sender, content, channel, false, "f453f3e0");
+    let (payload, _) = create_bitchat_message_payload_full(sender, content, channel, false, sender_peer_id);
+    debug_println!("[PAYLOAD] Created payload: {} bytes", payload.len());
     payload
 }
 
@@ -3361,6 +3695,7 @@ fn create_bitchat_message_payload_with_flags(sender: &str, content: &str, channe
 }
 
 fn create_bitchat_message_payload_full(sender: &str, content: &str, channel: Option<&str>, is_private: bool, sender_peer_id: &str) -> (Vec<u8>, String) {
+    debug_println!("[PAYLOAD_FULL] Creating full payload: channel={:?}, is_private={}", channel, is_private);
     // Match Swift's toBinaryPayload format exactly
     let mut data = Vec::new();
     let mut flags: u8 = 0;
@@ -3378,6 +3713,7 @@ fn create_bitchat_message_payload_full(sender: &str, content: &str, channel: Opt
         // The recipient is handled at the packet level
     }
     
+    debug_println!("[PAYLOAD_FULL] Flags: 0x{:02X}", flags);
     data.push(flags);
     
     let timestamp_ms = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64;
@@ -3401,6 +3737,23 @@ fn create_bitchat_message_payload_full(sender: &str, content: &str, channel: Opt
     if let Some(channel_name) = channel {
         data.push(channel_name.len() as u8);
         data.extend_from_slice(channel_name.as_bytes());
+        debug_println!("[PAYLOAD_FULL] Added channel: {}", channel_name);
+    } else {
+        debug_println!("[PAYLOAD_FULL] No channel (public message)");
+    }
+    
+    debug_println!("[PAYLOAD_FULL] Final payload size: {} bytes", data.len());
+    
+    // Debug the exact payload structure for public messages
+    if channel.is_none() {
+        println!("[PUBLIC_MSG_PAYLOAD] Public message payload breakdown:");
+        println!("[PUBLIC_MSG_PAYLOAD] - Flags: 0x{:02X}", flags);
+        println!("[PUBLIC_MSG_PAYLOAD] - Timestamp: {} bytes", 8);
+        println!("[PUBLIC_MSG_PAYLOAD] - ID length: {} (actual ID: {})", id.len(), id);
+        println!("[PUBLIC_MSG_PAYLOAD] - Sender length: {} ({})", sender.len(), sender);
+        println!("[PUBLIC_MSG_PAYLOAD] - Content length: {} bytes ({})", content.len(), content);
+        println!("[PUBLIC_MSG_PAYLOAD] - Sender peer ID length: {} ({})", sender_peer_id.len(), sender_peer_id);
+        println!("[PUBLIC_MSG_PAYLOAD] - Total: {} bytes", data.len());
     }
     
     (data, id)
@@ -3457,6 +3810,9 @@ fn create_encrypted_channel_message_payload(
 }
 
 fn parse_bitchat_packet(data: &[u8]) -> Result<BitchatPacket, &'static str> {
+    // Remove padding first (matching Swift's BinaryProtocol.decode)
+    let unpadded_data = remove_message_padding(data);
+    
     // Swift BinaryProtocol format:
     // Header (Fixed 13 bytes):
     // - Version: 1 byte
@@ -3471,21 +3827,21 @@ fn parse_bitchat_packet(data: &[u8]) -> Result<BitchatPacket, &'static str> {
     const RECIPIENT_ID_SIZE: usize = 8;
     const SIGNATURE_SIZE: usize = 64;
 
-    if data.len() < HEADER_SIZE + SENDER_ID_SIZE { 
+    if unpadded_data.len() < HEADER_SIZE + SENDER_ID_SIZE { 
         return Err("Packet too small."); 
     }
 
     let mut offset = 0;
 
     // 1. Version (1 byte)
-    let version = data[offset]; 
+    let version = unpadded_data[offset]; 
     offset += 1;
     if version != 1 { 
         return Err("Unsupported version."); 
     }
 
     // 2. Type (1 byte)
-    let msg_type_raw = data[offset]; 
+    let msg_type_raw = unpadded_data[offset]; 
     offset += 1;
     let msg_type = match msg_type_raw {
         0x01 => MessageType::Announce, 
@@ -3516,24 +3872,24 @@ fn parse_bitchat_packet(data: &[u8]) -> Result<BitchatPacket, &'static str> {
     };
 
     // 3. TTL (1 byte)
-    let ttl = data[offset]; 
+    let ttl = unpadded_data[offset]; 
     offset += 1;
     
     // 4. Timestamp (8 bytes) - we skip it for now
     offset += 8;
 
     // 5. Flags (1 byte)
-    let flags = data[offset]; 
+    let flags = unpadded_data[offset]; 
     offset += 1;
     let has_recipient = (flags & FLAG_HAS_RECIPIENT) != 0;
     let has_signature = (flags & FLAG_HAS_SIGNATURE) != 0;
     let is_compressed = (flags & FLAG_IS_COMPRESSED) != 0;
 
     // 6. Payload length (2 bytes, big-endian)
-    if data.len() < offset + 2 {
+    if unpadded_data.len() < offset + 2 {
         return Err("Packet too small for payload length.");
     }
-    let payload_len_bytes: [u8; 2] = data[offset..offset + 2].try_into().unwrap();
+    let payload_len_bytes: [u8; 2] = unpadded_data[offset..offset + 2].try_into().unwrap();
     let payload_len = u16::from_be_bytes(payload_len_bytes) as usize; 
     offset += 2;
 
@@ -3546,35 +3902,23 @@ fn parse_bitchat_packet(data: &[u8]) -> Result<BitchatPacket, &'static str> {
         expected_size += SIGNATURE_SIZE;
     }
     
-    if data.len() < expected_size { 
+    if unpadded_data.len() < expected_size { 
         return Err("Packet data shorter than expected."); 
     }
 
-    // 7. Sender ID (8 bytes)
-    let sender_id = data[offset..offset + SENDER_ID_SIZE].to_vec();
-    // Convert raw bytes to hex string (matching Swift protocol)
-    // Remove trailing zeros (padding) and convert to hex
-    let trimmed_sender_id = sender_id.iter().take_while(|&&b| b != 0).copied().collect::<Vec<u8>>();
-    let sender_id_str = if trimmed_sender_id.is_empty() {
-        "00000000".to_string() // Fallback for all-zero IDs
-    } else {
-        hex::encode(&trimmed_sender_id)
-    };
+    // 7. Sender ID (8 bytes) - now raw bytes, not ASCII
+    let sender_id = unpadded_data[offset..offset + SENDER_ID_SIZE].to_vec();
+    // Convert raw bytes to hex string
+    let sender_id_str = hex::encode(&sender_id);
     offset += SENDER_ID_SIZE;
 
     // 8. Recipient ID (8 bytes if hasRecipient flag set)
     let (recipient_id, recipient_id_str) = if has_recipient { 
-        let recipient_id = data[offset..offset + RECIPIENT_ID_SIZE].to_vec();
-        // Handle both ASCII hex strings and raw bytes
-        let recipient_id_str = if recipient_id.iter().all(|&b| b.is_ascii_alphanumeric() || b == 0) {
-            // ASCII format
-            String::from_utf8_lossy(&recipient_id).trim_end_matches('\0').to_string()
-        } else {
-            // Raw bytes format - convert to hex
-            hex::encode(&recipient_id).trim_end_matches('0').to_string()
-        };
+        let recipient_id = unpadded_data[offset..offset + RECIPIENT_ID_SIZE].to_vec();
+        // Convert raw bytes to hex string
+        let recipient_id_str = hex::encode(&recipient_id);
         debug_full_println!("[PACKET] Recipient ID raw bytes: {:?}", recipient_id);
-        debug_full_println!("[PACKET] Recipient ID as string: '{}'", recipient_id_str);
+        debug_full_println!("[PACKET] Recipient ID as hex: {}", recipient_id_str);
         offset += RECIPIENT_ID_SIZE;
         (Some(recipient_id), Some(recipient_id_str))
     } else {
@@ -3582,7 +3926,7 @@ fn parse_bitchat_packet(data: &[u8]) -> Result<BitchatPacket, &'static str> {
     };
 
     // 9. Payload
-    let mut payload = data[offset..offset + payload_len].to_vec();
+    let mut payload = unpadded_data[offset..offset + payload_len].to_vec();
     offset += payload_len;
     
     // 10. Signature (64 bytes if hasSignature flag set)
@@ -3602,9 +3946,126 @@ fn parse_bitchat_packet(data: &[u8]) -> Result<BitchatPacket, &'static str> {
     Ok(BitchatPacket { msg_type, _sender_id: sender_id, sender_id_str, recipient_id, recipient_id_str, payload, ttl })
 }
 
+// Helper functions for peer identity management
+
+fn update_peer_binding(
+    peer_id: &str,
+    fingerprint: &str,
+    binding: PeerIdentityBinding,
+    peer_bindings: &Arc<Mutex<HashMap<String, PeerIdentityBinding>>>,
+    fingerprint_to_peer_id: &Arc<Mutex<HashMap<String, String>>>,
+    peers: &Arc<Mutex<HashMap<String, Peer>>>,
+) {
+    // Update peer bindings
+    peer_bindings.lock().unwrap().insert(peer_id.to_string(), binding.clone());
+    
+    // Update fingerprint to peer ID mapping
+    fingerprint_to_peer_id.lock().unwrap().insert(fingerprint.to_string(), peer_id.to_string());
+    
+    // Update peer with binding
+    if let Some(peer) = peers.lock().unwrap().get_mut(peer_id) {
+        peer.identity_binding = Some(binding);
+    }
+}
+
+fn lock_rotation(rotation_locked: &Arc<Mutex<bool>>) {
+    *rotation_locked.lock().unwrap() = true;
+    debug_println!("[ROTATION] Rotation locked during handshake");
+}
+
+fn unlock_rotation(rotation_locked: &Arc<Mutex<bool>>) {
+    *rotation_locked.lock().unwrap() = false;
+    debug_println!("[ROTATION] Rotation unlocked");
+}
+
+fn is_peer_id_ours(peer_id: &str, my_peer_id: &str) -> bool {
+    // In a real implementation, this would check if the peer_id belongs to any of our devices
+    // For now, just check if it's our current peer_id
+    peer_id == my_peer_id
+}
+
+async fn send_noise_identity_announce(
+    target_peer_id: &str,
+    my_peer_id: &str,
+    nickname: &str,
+    noise_service: &Arc<NoiseIntegrationService>,
+    peripheral: &Peripheral,
+    cmd_char: &Characteristic,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let static_public_key = noise_service.get_static_public_key();
+    
+    let identity_announcement = NoiseIdentityAnnouncement {
+        peer_id: my_peer_id.to_string(),
+        public_key: static_public_key.clone(),
+        nickname: nickname.to_string(),
+        timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64(),
+        previous_peer_id: None,
+        signature: vec![], // We'll add proper signature later if needed
+    };
+    
+    let identity_payload = serde_json::to_vec(&identity_announcement)?;
+    let announce_packet = create_bitchat_packet_with_recipient(
+        my_peer_id,
+        Some(target_peer_id),
+        MessageType::NoiseIdentityAnnounce,
+        identity_payload,
+        None
+    );
+    
+    peripheral.write(cmd_char, &announce_packet, WriteType::WithoutResponse).await?;
+    debug_println!("[IDENTITY] Sent NoiseIdentityAnnounce to peer {}", target_peer_id);
+    
+    Ok(())
+}
+
+async fn initiate_noise_handshake(
+    target_peer_id: &str,
+    my_peer_id: &str,
+    noise_service: &Arc<NoiseIntegrationService>,
+    peripheral: &Peripheral,
+    cmd_char: &Characteristic,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match noise_service.initiate_handshake(target_peer_id) {
+        Ok(handshake_msg) => {
+            debug_println!("[HANDSHAKE] Initiated handshake with {}, sending {} bytes", target_peer_id, handshake_msg.len());
+            
+            let handshake_packet = create_bitchat_packet_with_recipient(
+                my_peer_id,
+                Some(target_peer_id),
+                MessageType::NoiseHandshakeInit,
+                handshake_msg.clone(),
+                None
+            );
+            
+            println!("[HANDSHAKE_DEBUG] Packet breakdown:");
+            println!("  - Total packet size: {} bytes", handshake_packet.len());
+            println!("  - Handshake payload size: {} bytes", handshake_msg.len());
+            println!("  - Expected structure: 13 (header) + 8 (sender) + 8 (recipient) + {} (payload) = {} bytes", 
+                handshake_msg.len(), 13 + 8 + 8 + handshake_msg.len());
+            
+            // Log the payload length field specifically
+            if handshake_packet.len() >= 15 {
+                let payload_len_bytes = &handshake_packet[13..15];
+                let payload_len = u16::from_be_bytes([payload_len_bytes[0], payload_len_bytes[1]]);
+                println!("  - Payload length field: {} (0x{:04X})", payload_len, payload_len);
+            }
+            
+            peripheral.write(cmd_char, &handshake_packet, WriteType::WithoutResponse).await?;
+            debug_println!("[HANDSHAKE] Sent handshake init to {}", target_peer_id);
+        },
+        Err(e) => {
+            debug_println!("[!] Failed to initiate Noise handshake: {:?}", e);
+            return Err(Box::new(e));
+        }
+    }
+    
+    Ok(())
+}
+
 // Legacy function removed - now using Noise-only implementation
 
 fn create_bitchat_packet(sender_id_str: &str, msg_type: MessageType, payload: Vec<u8>) -> Vec<u8> {
+    debug_println!("[PACKET] create_bitchat_packet called: type={:?}, payload_len={}", msg_type, payload.len());
     create_bitchat_packet_with_recipient(sender_id_str, None, msg_type, payload, None)
 }
 
@@ -3659,7 +4120,7 @@ fn create_bitchat_packet_with_recipient(sender_id_str: &str, recipient_id_str: O
     let mut flags: u8 = 0;
     let has_recipient = match msg_type {
         MessageType::FragmentStart | MessageType::FragmentContinue | MessageType::FragmentEnd => false,
-        _ => true
+        _ => true  // All non-fragment messages have a recipient (broadcast or specific)
     };
     if has_recipient {
         flags |= FLAG_HAS_RECIPIENT;
@@ -3677,44 +4138,36 @@ fn create_bitchat_packet_with_recipient(sender_id_str: &str, recipient_id_str: O
     debug_full_println!("[PACKET] Header: version={}, type=0x{:02X}, ttl={}, flags=0x{:02X}, payload_len={}", 
             version, msg_type_byte, ttl, flags, payload_length);
     
-    // 7. Sender ID (8 bytes) - Convert hex string to raw bytes (matching Mac client)
-    let mut sender_id_bytes = if sender_id_str.len() % 2 == 0 && sender_id_str.chars().all(|c| c.is_ascii_hexdigit()) {
-        // Convert hex string to raw bytes
-        hex::decode(sender_id_str).unwrap_or_else(|_| sender_id_str.as_bytes().to_vec())
-    } else {
-        // Fallback to ASCII bytes if not valid hex
-        sender_id_str.as_bytes().to_vec()
-    };
+    // 7. Sender ID (8 bytes) - Store as raw bytes from hex string
+    let sender_id_bytes = hex::decode(sender_id_str).unwrap_or_else(|_| {
+        // Fallback if not valid hex - pad with zeros
+        vec![0u8; 8]
+    });
     
-    // Pad to 8 bytes with zeros
-    if sender_id_bytes.len() < 8 {
-        sender_id_bytes.resize(8, 0);
-    } else if sender_id_bytes.len() > 8 {
-        sender_id_bytes.truncate(8);
-    }
-    data.extend_from_slice(&sender_id_bytes);
-    debug_full_println!("[PACKET] Sender ID: {} -> {} raw bytes: {}", sender_id_str, sender_id_bytes.len(), hex::encode(&sender_id_bytes));
+    // Ensure exactly 8 bytes
+    let mut sender_id_final = [0u8; 8];
+    let copy_len = sender_id_bytes.len().min(8);
+    sender_id_final[..copy_len].copy_from_slice(&sender_id_bytes[..copy_len]);
+    
+    data.extend_from_slice(&sender_id_final);
+    debug_full_println!("[PACKET] Sender ID: {} -> 8 raw bytes: {}", sender_id_str, hex::encode(&sender_id_final));
     
     // 8. Recipient ID (8 bytes) - only if hasRecipient flag is set
     if has_recipient {
         if let Some(recipient) = recipient_id_str {
-            // Private message - use specific recipient, convert hex to raw bytes
-            let mut recipient_bytes = if recipient.len() % 2 == 0 && recipient.chars().all(|c| c.is_ascii_hexdigit()) {
-                // Convert hex string to raw bytes
-                hex::decode(recipient).unwrap_or_else(|_| recipient.as_bytes().to_vec())
-            } else {
-                // Fallback to ASCII bytes if not valid hex
-                recipient.as_bytes().to_vec()
-            };
+            // Private message - use specific recipient (raw bytes from hex)
+            let recipient_id_bytes = hex::decode(recipient).unwrap_or_else(|_| {
+                // Fallback if not valid hex - pad with zeros
+                vec![0u8; 8]
+            });
             
-            // Pad to 8 bytes with zeros
-            if recipient_bytes.len() < 8 {
-                recipient_bytes.resize(8, 0);
-            } else if recipient_bytes.len() > 8 {
-                recipient_bytes.truncate(8);
-            }
-            data.extend_from_slice(&recipient_bytes);
-            debug_full_println!("[PACKET] Recipient ID (private): {} -> {} raw bytes: {}", recipient, recipient_bytes.len(), hex::encode(&recipient_bytes));
+            // Ensure exactly 8 bytes
+            let mut recipient_id_final = [0u8; 8];
+            let copy_len = recipient_id_bytes.len().min(8);
+            recipient_id_final[..copy_len].copy_from_slice(&recipient_id_bytes[..copy_len]);
+            
+            data.extend_from_slice(&recipient_id_final);
+            debug_full_println!("[PACKET] Recipient ID (private): {} -> 8 raw bytes: {}", recipient, hex::encode(&recipient_id_final));
         } else {
             // Broadcast message
             data.extend_from_slice(&BROADCAST_RECIPIENT);
@@ -3744,6 +4197,7 @@ fn create_bitchat_packet_with_recipient(sender_id_str: &str, recipient_id_str: O
     debug_full_println!("[PACKET]   - Type (1 byte): {}", hex::encode(&data[offset..offset+1])); offset += 1;
     debug_full_println!("[PACKET]   - TTL (1 byte): {}", hex::encode(&data[offset..offset+1])); offset += 1;
     debug_full_println!("[PACKET]   - Timestamp (8 bytes): {}", hex::encode(&data[offset..offset+8])); offset += 8;
+    
     debug_full_println!("[PACKET]   - Flags (1 byte): {}", hex::encode(&data[offset..offset+1])); offset += 1;
     debug_full_println!("[PACKET]   - PayloadLength (2 bytes): {}", hex::encode(&data[offset..offset+2])); offset += 2;
     debug_full_println!("[PACKET]   - Sender ID (8 bytes): {}", hex::encode(&data[offset..offset+8])); offset += 8;
@@ -3762,7 +4216,69 @@ fn create_bitchat_packet_with_recipient(sender_id_str: &str, recipient_id_str: O
     
     debug_full_println!("[PACKET] ==================== PACKET CREATION END ====================");
     
-    data
+    // Apply padding like Swift does for traffic analysis resistance
+    let original_len = data.len();
+    let padded_data = apply_message_padding(data);
+    debug_full_println!("[PACKET] Applied padding: {} -> {} bytes", original_len, padded_data.len());
+    
+    padded_data
+}
+
+// Message padding utilities (matching Swift's MessagePadding)
+fn apply_message_padding(data: Vec<u8>) -> Vec<u8> {
+    const BLOCK_SIZES: [usize; 4] = [256, 512, 1024, 2048];
+    
+    // Account for encryption overhead (~16 bytes for AES-GCM tag)
+    let total_size = data.len() + 16;
+    
+    // Find smallest block that fits
+    let target_size = BLOCK_SIZES.iter()
+        .find(|&&block_size| total_size <= block_size)
+        .copied()
+        .unwrap_or(data.len()); // For very large messages, use original size
+    
+    // If no padding needed, return original
+    if data.len() >= target_size {
+        return data;
+    }
+    
+    let padding_needed = target_size - data.len();
+    
+    // PKCS#7 only supports padding up to 255 bytes
+    if padding_needed > 255 {
+        return data;
+    }
+    
+    let mut padded = data;
+    
+    // Add random bytes for padding (except the last byte)
+    for _ in 0..padding_needed - 1 {
+        padded.push(rand::random::<u8>());
+    }
+    
+    // Last byte contains the padding length (PKCS#7 style)
+    padded.push(padding_needed as u8);
+    
+    padded
+}
+
+// Remove message padding (matching Swift's MessagePadding.unpad)
+fn remove_message_padding(data: &[u8]) -> &[u8] {
+    if data.is_empty() {
+        return data;
+    }
+    
+    // Last byte tells us how much padding to remove
+    let padding_length = data[data.len() - 1] as usize;
+    
+    // Validate padding length
+    if padding_length == 0 || padding_length > data.len() {
+        // Invalid padding, return original data
+        return data;
+    }
+    
+    // Return data without padding
+    &data[..data.len() - padding_length]
 }
 
 // Create delivery ACK matching iOS format
@@ -3853,7 +4369,25 @@ fn create_fragment_packet(sender_id: &str, fragment: Fragment) -> Vec<u8> {
 // Enable fragmentation to match Swift's 500-byte threshold
 // This fixes the issue where messages disappear after a certain length
 pub fn should_fragment(packet_data: &[u8]) -> bool {
-    packet_data.len() > 500  // Fragment complete packets larger than 500 bytes
+    packet_data.len() > 512  // Fragment complete packets larger than 512 bytes (matching Swift)
+}
+
+// Pad packet to appropriate block size (matching Swift's MessagePadding)
+fn pad_to_block_size(mut packet: Vec<u8>) -> Vec<u8> {
+    // Find the smallest block size that fits
+    for &block_size in &BLOCK_SIZES {
+        if packet.len() <= block_size {
+            if packet.len() < block_size {
+                debug_println!("[PADDING] Padding packet from {} to {} bytes", packet.len(), block_size);
+                packet.resize(block_size, 0);
+            }
+            return packet;
+        }
+    }
+    
+    // If packet is larger than all block sizes, return as-is (will be fragmented)
+    debug_println!("[PADDING] Packet size {} exceeds max block size, no padding applied", packet.len());
+    packet
 } 
 
 // Swift-compatible packet sending with automatic fragmentation
@@ -3863,19 +4397,16 @@ async fn send_packet_with_fragmentation(
     packet: Vec<u8>,
     my_peer_id: &str
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Swift's logic: if packet > 500 bytes, fragment it
-    if packet.len() > 500 {
+    // Swift's logic: if packet > 512 bytes, fragment it
+    if packet.len() > 512 {
         println!("[FRAG] ==================== FRAGMENTATION START ====================");
         println!("[FRAG] Original packet size: {} bytes", packet.len());
         println!("[FRAG] Original packet hex (first 64 bytes): {}", hex::encode(&packet[..std::cmp::min(64, packet.len())]));
         
         // Fragment the complete packet data into chunks
-        // iOS BLE MTU is typically 185 bytes by default (can negotiate higher)
-        // Fragment overhead: 13 (fragment metadata) + 21 (packet header) = 34 bytes
-        // Safe chunk size: 150 bytes to ensure compatibility with default iOS MTU
-        // This results in ~184 byte packets which work reliably on iOS
-        let fragment_size = 150; // Conservative size for iOS BLE compatibility
-        let chunks: Vec<&[u8]> = packet.chunks(fragment_size).collect();
+        // Swift uses maxFragmentSize = 500 (hardcoded)
+        const MAX_FRAGMENT_SIZE: usize = 460;
+        let chunks: Vec<&[u8]> = packet.chunks(MAX_FRAGMENT_SIZE).collect();
         let total_fragments = chunks.len() as u16;
         
         // Generate random 8-byte fragment ID (matching working example)
@@ -3883,7 +4414,7 @@ async fn send_packet_with_fragmentation(
         rand::thread_rng().fill(&mut fragment_id);
         
         println!("[FRAG] Fragment ID: {}", hex::encode(&fragment_id));
-        println!("[FRAG] Fragment size: {} bytes", fragment_size);
+        println!("[FRAG] Fragment size: {} bytes", MAX_FRAGMENT_SIZE);
         println!("[FRAG] Total fragments: {}", total_fragments);
         
         // Send fragments with Swift's timing (20ms delay)
@@ -3994,14 +4525,20 @@ async fn send_packet_with_fragmentation(
         Ok(())
     } else {
         // Packet is small enough, send directly
-        let write_type = if packet.len() > 512 {
+        debug_println!("[FRAG] No fragmentation needed, sending {} bytes directly", packet.len());
+        
+        // Pad packet to appropriate block size
+        let padded_packet = pad_to_block_size(packet);
+        
+        let write_type = if padded_packet.len() > 512 {
             WriteType::WithResponse
         } else {
             WriteType::WithoutResponse
         };
         
-        if peripheral.write(cmd_char, &packet, write_type).await.is_err() {
-            return Err(format!("Failed to send {} byte packet", packet.len()).into());
+        debug_println!("[FRAG] About to send unfragmented packet with write_type: {:?}, size: {} bytes", write_type, padded_packet.len());
+        if peripheral.write(cmd_char, &padded_packet, write_type).await.is_err() {
+            return Err(format!("Failed to send {} byte packet", padded_packet.len()).into());
         }
         
         Ok(())
@@ -4274,7 +4811,7 @@ mod tests {
     #[test]
     fn test_rust_client_message_roundtrip() {
         // Test that the Rust client can parse messages it sends itself
-        let sender_id = "a1b2c3d4"; // 8-character hex string
+        let sender_id = "a1b2c3d4e5f6a7b8"; // 16-character hex string (8 bytes)
         let test_message = "Hello, world!";
         
         // Create a message payload using the actual function
@@ -4304,7 +4841,7 @@ mod tests {
     #[test]
     fn test_channel_message_roundtrip() {
         // Test unencrypted channel message roundtrip
-        let sender_id = "b1c2d3e4"; // 8-character hex string
+        let sender_id = "b1c2d3e4f5a6b7c8"; // 16-character hex string (8 bytes)
         let test_message = "Hello #general!";
         let channel_name = "#general";
         
@@ -4335,7 +4872,7 @@ mod tests {
     #[test]
     fn test_encrypted_channel_message_roundtrip() {
         // Test encrypted channel message with correct and wrong passwords
-        let sender_id = "c1d2e3f4";
+        let sender_id = "c1d2e3f4a5b6c7d8";
         let test_message = "Secret message for #private";
         let channel_name = "#private";
         let correct_password = "test1234";
@@ -4388,8 +4925,8 @@ mod tests {
     #[test]
     fn test_noise_dm_roundtrip() {
         // Test Noise-encrypted DM with correct and wrong keys
-        let sender_id = "d1e2f3a4";
-        let recipient_id = "a4f3e2d1";
+        let sender_id = "d1e2f3a4b5c6d7e8";
+        let recipient_id = "a4f3e2d1b8c7f6a5";
         let test_message = "Private DM message";
         let nickname = "sender";
         
@@ -4422,10 +4959,13 @@ mod tests {
         // Create encrypted DM payload
         let (payload, message_id) = create_bitchat_message_payload_full(nickname, test_message, None, true, sender_id);
         
-        // Encrypt the payload for the recipient
-        let encrypted_payload = sender_noise.encrypt_for_peer(recipient_id, &payload).expect("Failed to encrypt DM");
+        // Create inner packet (matching Swift)
+        let inner_packet = create_bitchat_packet(sender_id, MessageType::Message, payload);
         
-        // Create the packet with NoiseEncrypted type
+        // Encrypt the entire inner packet for the recipient
+        let encrypted_payload = sender_noise.encrypt_for_peer(recipient_id, &inner_packet).expect("Failed to encrypt DM");
+        
+        // Create the outer packet with NoiseEncrypted type
         let packet = create_bitchat_packet_with_recipient(sender_id, Some(recipient_id), MessageType::NoiseEncrypted, encrypted_payload, None);
         
         // Parse the packet back
@@ -4437,10 +4977,17 @@ mod tests {
         assert_eq!(parsed.recipient_id_str, Some(recipient_id.to_string()));
         
         // Test decryption with correct recipient key
-        let decrypted_payload = recipient_noise.decrypt_from_peer(sender_id, &parsed.payload).expect("Failed to decrypt with correct key");
+        let decrypted_packet_data = recipient_noise.decrypt_from_peer(sender_id, &parsed.payload).expect("Failed to decrypt with correct key");
         
-        // Parse the decrypted message
-        let message = parse_bitchat_message_payload(&decrypted_payload).expect("Failed to parse decrypted message");
+        // Parse the decrypted inner packet
+        let inner_packet = parse_bitchat_packet(&decrypted_packet_data).expect("Failed to parse decrypted inner packet");
+        
+        // Verify inner packet structure
+        assert_eq!(inner_packet.msg_type, MessageType::Message);
+        assert_eq!(inner_packet.sender_id_str, sender_id);
+        
+        // Parse the message from the inner packet
+        let message = parse_bitchat_message_payload(&inner_packet.payload).expect("Failed to parse decrypted message");
         
         // Verify message content
         assert_eq!(message.content, test_message);
@@ -4487,6 +5034,54 @@ mod tests {
     }
 
     #[test]
+    fn test_message_padding_roundtrip() {
+        // Test that our padding/unpadding matches Swift's behavior
+        let original_data = vec![1, 2, 3, 4, 5]; // Small test data
+        
+        // Apply padding
+        let padded = apply_message_padding(original_data.clone());
+        
+        // Should be padded to at least 256 bytes (smallest block for 5+16=21 bytes)
+        assert!(padded.len() >= 256);
+        
+        // Last byte should contain the padding length
+        let padding_length = padded[padded.len() - 1] as usize;
+        assert!(padding_length > 0);
+        assert!(padding_length <= 255);
+        
+        // Remove padding
+        let unpadded = remove_message_padding(&padded);
+        
+        // Should match original
+        assert_eq!(unpadded, original_data);
+    }
+
+    #[test]
+    fn test_handshake_packet_structure() {
+        // Test that handshake packets have the correct structure
+        let sender_id = "1234567890abcdef";
+        let recipient_id = "fedcba0987654321";
+        let handshake_payload = vec![0x42; 32]; // 32-byte mock handshake data
+        
+        let packet = create_bitchat_packet_with_recipient(
+            sender_id,
+            Some(recipient_id),
+            MessageType::NoiseHandshakeInit,
+            handshake_payload.clone(),
+            None
+        );
+        
+        // Parse the packet back
+        let parsed = parse_bitchat_packet(&packet).expect("Failed to parse handshake packet");
+        
+        // Verify structure
+        assert_eq!(parsed.msg_type, MessageType::NoiseHandshakeInit);
+        assert_eq!(parsed.sender_id_str, sender_id);
+        assert_eq!(parsed.recipient_id_str, Some(recipient_id.to_string()));
+        assert_eq!(parsed.payload, handshake_payload);
+    }
+
+    #[test]
     fn test_protocol_constants() {
         // Verify protocol constants match Swift/Android implementations
         assert_eq!(FLAG_HAS_RECIPIENT, 0x01);
@@ -4495,5 +5090,91 @@ mod tests {
         assert_eq!(MSG_FLAG_HAS_CHANNEL, 0x40);
         assert_eq!(SIGNATURE_SIZE, 64);
         assert_eq!(BROADCAST_RECIPIENT, [0xFF; 8]);
+    }
+
+    #[test]
+    fn test_noise_identity_announce_handling() {
+        use std::sync::Arc;
+        use std::sync::Mutex;
+        use std::collections::HashMap;
+        
+        // Setup test data
+        let my_peer_id = "test_peer_123";
+        let sender_peer_id = "sender_peer_456";
+        let sender_nickname = "TestSender";
+        
+        // Create shared state
+        let peers: Arc<Mutex<HashMap<String, Peer>>> = Arc::new(Mutex::new(HashMap::new()));
+        let peer_bindings: Arc<Mutex<HashMap<String, PeerIdentityBinding>>> = Arc::new(Mutex::new(HashMap::new()));
+        let fingerprint_to_peer_id: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+        
+        // Create a test announcement
+        let announcement = NoiseIdentityAnnouncement {
+            peer_id: sender_peer_id.to_string(),
+            public_key: vec![1, 2, 3, 4, 5, 6, 7, 8],
+            nickname: sender_nickname.to_string(),
+            timestamp: 1234567890.0,
+            previous_peer_id: None,
+            signature: vec![],
+        };
+        
+        // Calculate fingerprint
+        let hash = sha2::Sha256::digest(&announcement.public_key);
+        let fingerprint = hex::encode(hash);
+        
+        // Create binding
+        let binding = PeerIdentityBinding {
+            current_peer_id: announcement.peer_id.clone(),
+            fingerprint: fingerprint.clone(),
+            public_key: announcement.public_key.clone(),
+            nickname: announcement.nickname.clone(),
+            binding_timestamp: announcement.timestamp,
+            signature: announcement.signature.clone(),
+        };
+        
+        // First add the peer to the peers map (as would happen in the actual handler)
+        {
+            let mut peers_lock = peers.lock().unwrap();
+            peers_lock.insert(sender_peer_id.to_string(), Peer {
+                nickname: Some(sender_nickname.to_string()),
+                identity_binding: None,
+            });
+        }
+        
+        // Test update_peer_binding
+        update_peer_binding(
+            &announcement.peer_id,
+            &fingerprint,
+            binding.clone(),
+            &peer_bindings,
+            &fingerprint_to_peer_id,
+            &peers,
+        );
+        
+        // Verify peer binding was updated
+        {
+            let peers_lock = peers.lock().unwrap();
+            assert!(peers_lock.contains_key(sender_peer_id));
+            let peer = peers_lock.get(sender_peer_id).unwrap();
+            assert!(peer.identity_binding.is_some());
+            assert_eq!(peer.identity_binding.as_ref().unwrap().fingerprint, fingerprint);
+        }
+        
+        // Verify bindings were updated
+        {
+            let bindings = peer_bindings.lock().unwrap();
+            assert!(bindings.contains_key(sender_peer_id));
+            assert_eq!(bindings.get(sender_peer_id).unwrap().fingerprint, fingerprint);
+        }
+        
+        // Verify fingerprint mapping
+        {
+            let mappings = fingerprint_to_peer_id.lock().unwrap();
+            assert_eq!(mappings.get(&fingerprint).unwrap(), sender_peer_id);
+        }
+        
+        // Test that we can acquire locks after handling (no deadlock)
+        let can_acquire_peers = peers.try_lock().is_ok();
+        assert!(can_acquire_peers, "Should be able to acquire peers lock");
     }
 } 

@@ -1,17 +1,16 @@
 // Integration layer between the existing encryption service and new Noise protocol
 // This provides backward compatibility while adding Noise support
 
-use crate::noise::{NoiseSessionManager, NoiseError, NoiseMessageType, NoiseMessage};
+use crate::noise::{NoiseSessionManager, NoiseError};
 use std::sync::{Arc, RwLock};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use sha2::{Sha256, Digest};
 use pbkdf2::pbkdf2_hmac;
 use rand::rngs::OsRng;
-use ed25519_dalek::{SigningKey, Signature, Signer};
+use ed25519_dalek::{SigningKey, Signature, Signer, VerifyingKey, Verifier};
 // Use snow's built-in ChaCha20-Poly1305 cipher implementation
 use snow::resolvers::{DefaultResolver, CryptoResolver};
-use snow::types::Cipher;
 use snow::params::CipherChoice;
 
 pub struct NoiseIntegrationService {
@@ -106,40 +105,22 @@ impl NoiseIntegrationService {
 
         let handshake_data = self.session_manager.initiate_handshake(peer_id)?;
 
-        // Create Noise message wrapper
-        let session_id = format!("{}_{}", peer_id, now);
-        let noise_msg = NoiseMessage::new(
-            NoiseMessageType::HandshakeInitiation,
-            session_id,
-            handshake_data
-        );
-
-        noise_msg.encode()
+        // Return raw handshake data without JSON wrapper (matching Swift)
+        Ok(handshake_data)
     }
 
     // Process incoming handshake message
     pub fn process_handshake_message(&self, peer_id: &str, data: &[u8]) -> Result<Option<Vec<u8>>, NoiseError> {
-        // Try to decode as Noise message first, fall back to raw data
-        let payload = if let Ok(noise_msg) = NoiseMessage::decode(data) {
-            noise_msg.payload
-        } else {
-            // Assume raw handshake data for compatibility
-            data.to_vec()
-        };
+        // Use raw handshake data directly (matching Swift)
+        let payload = data.to_vec();
 
-        // Simple rate limiting - more permissive during tests
+        // Debug the handshake message being processed
+        println!("[NOISE_INTEGRATION_DEBUG] Processing handshake from {} ({} bytes)", peer_id, payload.len());
+        crate::noise::debug_handshake_message(&payload, &format!("NoiseIntegration for {}", peer_id));
+
+        // No rate limiting for processing handshake responses
+        // Rate limiting is only applied when initiating handshakes
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
-        {
-            let mut last_handshake = self.last_handshake.write().unwrap();
-            if let Some(&last_time) = last_handshake.get(peer_id) {
-                // Use milliseconds and allow rapid handshake exchanges for tests
-                let min_interval = if cfg!(test) { 0 } else { 1000 }; // No rate limiting for tests, 1s for production
-                if now - last_time < min_interval {
-                    return Err(NoiseError::RateLimitExceeded);
-                }
-            }
-            last_handshake.insert(peer_id.to_string(), now);
-        }
 
         let response = self.session_manager.handle_incoming_handshake(peer_id, &payload)?;
 
@@ -149,15 +130,8 @@ impl NoiseIntegrationService {
                 self.update_peer_info(peer_id);
             }
 
-            // Wrap response in Noise message
-            let session_id = format!("{}_{}", peer_id, now);
-            let noise_msg = NoiseMessage::new(
-                NoiseMessageType::HandshakeResponse,
-                session_id,
-                response_data
-            );
-
-            Ok(Some(noise_msg.encode()?))
+            // Return raw response data without JSON wrapper (matching Swift)
+            Ok(Some(response_data))
         } else {
             // Handshake complete
             if self.session_manager.has_established_session(peer_id) {
@@ -189,28 +163,14 @@ impl NoiseIntegrationService {
 
         let encrypted = self.session_manager.encrypt(peer_id, data)?;
 
-        // Wrap in Noise message
-        let session_id = format!("{}_{}", peer_id, now);
-        let noise_msg = NoiseMessage::new(
-            NoiseMessageType::EncryptedMessage,
-            session_id,
-            encrypted
-        );
-
-        noise_msg.encode()
+        // Return raw encrypted data without JSON wrapper (matching Swift)
+        Ok(encrypted)
     }
 
     // Decrypt data from a peer
     pub fn decrypt_from_peer(&self, peer_id: &str, data: &[u8]) -> Result<Vec<u8>, NoiseError> {
-        // Try to decode as Noise message first, fall back to raw data
-        let payload = if let Ok(noise_msg) = NoiseMessage::decode(data) {
-            noise_msg.payload
-        } else {
-            // Assume raw encrypted data for compatibility
-            data.to_vec()
-        };
-
-        self.session_manager.decrypt(peer_id, &payload)
+        // Use raw encrypted data directly (matching Swift)
+        self.session_manager.decrypt(peer_id, data)
     }
 
     // Get peer's public key
@@ -428,6 +388,45 @@ impl NoiseIntegrationService {
             None
         }
     }
+
+    /// Verify a signature using the peer's public key
+    /// Returns true if the signature is valid, false otherwise
+    pub fn verify_signature(&self, signature: &[u8], data: &[u8], public_key: &[u8]) -> bool {
+        // Validate signature length (Ed25519 signatures are 64 bytes)
+        if signature.len() != 64 {
+            return false;
+        }
+
+        // Validate public key length (Ed25519 public keys are 32 bytes)
+        if public_key.len() != 32 {
+            return false;
+        }
+
+        // Convert signature bytes to Ed25519 signature
+        let signature_array: [u8; 64] = match signature.try_into() {
+            Ok(arr) => arr,
+            Err(_) => return false,
+        };
+        let ed25519_signature = Signature::from_bytes(&signature_array);
+
+        // Convert public key bytes to Ed25519 verifying key
+        let public_key_array: [u8; 32] = match public_key.try_into() {
+            Ok(arr) => arr,
+            Err(_) => return false,
+        };
+        let verifying_key = match VerifyingKey::from_bytes(&public_key_array) {
+            Ok(key) => key,
+            Err(_) => return false,
+        };
+
+        // Verify the signature
+        verifying_key.verify(data, &ed25519_signature).is_ok()
+    }
+
+    /// Get peer's public key data (alias for get_peer_public_key)
+    pub fn get_peer_public_key_data(&self, peer_id: &str) -> Option<Vec<u8>> {
+        self.get_peer_public_key(peer_id)
+    }
 }
 
 #[cfg(test)]
@@ -520,5 +519,102 @@ mod tests {
 
         // Signatures should be different
         assert_ne!(signature_no_key, signature_with_key);
+    }
+
+    #[test]
+    fn test_signature_verification_valid() {
+        // Create service with signing key
+        let identity_key = [42u8; 32]; // Test key
+        let service = NoiseIntegrationService::with_signing_key(&identity_key).unwrap();
+        
+        // Sign some data
+        let data = b"Hello, signature verification!";
+        let signature = service.sign(data).expect("Should have signature");
+        
+        // Extract public key from signing key for verification
+        let signing_key = SigningKey::from_bytes(&identity_key);
+        let verifying_key = signing_key.verifying_key();
+        let public_key_bytes = verifying_key.to_bytes();
+        
+        // Verify the signature
+        let is_valid = service.verify_signature(&signature, data, &public_key_bytes);
+        assert!(is_valid, "Valid signature should verify successfully");
+    }
+
+    #[test]
+    fn test_signature_verification_invalid_signature() {
+        let service = NoiseIntegrationService::new().unwrap();
+        let data = b"test data";
+        let public_key = [1u8; 32];
+        let invalid_signature = [0u8; 64]; // Invalid signature
+        
+        let is_valid = service.verify_signature(&invalid_signature, data, &public_key);
+        assert!(!is_valid, "Invalid signature should not verify");
+    }
+
+    #[test]
+    fn test_signature_verification_wrong_data() {
+        // Create service with signing key
+        let identity_key = [123u8; 32];
+        let service = NoiseIntegrationService::with_signing_key(&identity_key).unwrap();
+        
+        // Sign some data
+        let original_data = b"original message";
+        let signature = service.sign(original_data).expect("Should have signature");
+        
+        // Try to verify with different data
+        let different_data = b"different message";
+        
+        // Extract public key
+        let signing_key = SigningKey::from_bytes(&identity_key);
+        let public_key_bytes = signing_key.verifying_key().to_bytes();
+        
+        let is_valid = service.verify_signature(&signature, different_data, &public_key_bytes);
+        assert!(!is_valid, "Signature should not verify with different data");
+    }
+
+    #[test]
+    fn test_signature_verification_invalid_signature_length() {
+        let service = NoiseIntegrationService::new().unwrap();
+        let data = b"test data";
+        let public_key = [1u8; 32];
+        
+        // Test too short signature
+        let short_signature = [0u8; 32];
+        let is_valid = service.verify_signature(&short_signature, data, &public_key);
+        assert!(!is_valid, "Short signature should not verify");
+        
+        // Test too long signature
+        let long_signature = [0u8; 96];
+        let is_valid = service.verify_signature(&long_signature, data, &public_key);
+        assert!(!is_valid, "Long signature should not verify");
+    }
+
+    #[test]
+    fn test_signature_verification_invalid_public_key_length() {
+        let service = NoiseIntegrationService::new().unwrap();
+        let data = b"test data";
+        let signature = [0u8; 64];
+        
+        // Test too short public key
+        let short_public_key = [0u8; 16];
+        let is_valid = service.verify_signature(&signature, data, &short_public_key);
+        assert!(!is_valid, "Short public key should not verify");
+        
+        // Test too long public key
+        let long_public_key = [0u8; 64];
+        let is_valid = service.verify_signature(&signature, data, &long_public_key);
+        assert!(!is_valid, "Long public key should not verify");
+    }
+
+    #[test]
+    fn test_signature_verification_malformed_public_key() {
+        let service = NoiseIntegrationService::new().unwrap();
+        let data = b"test data";
+        let signature = [0u8; 64];
+        let malformed_public_key = [255u8; 32]; // Invalid Ed25519 public key
+        
+        let is_valid = service.verify_signature(&signature, data, &malformed_public_key);
+        assert!(!is_valid, "Malformed public key should not verify");
     }
 }
