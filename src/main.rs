@@ -1756,16 +1756,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                          },
 
                          MessageType::Message => {
-                             debug_full_println!("[DEBUG] ==================== MESSAGE RECEIVED ====================");
-                             debug_full_println!("[DEBUG] Sender: {}", packet.sender_id_str);
-                             
-                             // Check if sender is blocked
-                             if let Some(fingerprint) = encryption_service.get_peer_fingerprint(&packet.sender_id_str) {
-                                 if blocked_peers.contains(&fingerprint) {
-                                     debug_println!("[BLOCKED] Ignoring message from blocked peer: {}", packet.sender_id_str);
-                                     continue; // Silent drop
-                                 }
-                             }
+    debug_full_println!("[DEBUG] ==================== MESSAGE RECEIVED ====================");
+    debug_full_println!("[DEBUG] Sender: {}", packet.sender_id_str);
+
+    unsafe {
+        if KNOWN_PEERS.is_none() {
+            KNOWN_PEERS = Some(HashMap::new());
+        }
+        if let Some(map) = KNOWN_PEERS.as_mut() {
+            let sender_key = packet.sender_id_str.clone();
+            let public_key = packet.sender_id_str.clone(); // adapte si nécessaire
+            if let Some(stored) = map.get(&sender_key) {
+                if stored != &public_key {
+                    println!("[SECURITY WARNING] Public key for '{}' has changed!", sender_key);
+                }
+            }
+            map.insert(sender_key, public_key);
+        }
+    }
+
+    // Check if sender is blocked
+    if let Some(fingerprint) = encryption_service.get_peer_fingerprint(&packet.sender_id_str) {
+        if blocked_peers.contains(&fingerprint) {
+            debug_println!("[BLOCKED] Ignoring message from blocked peer: {}", packet.sender_id_str);
+            continue; // Silent drop
+        }
+    }
                              
                              // Check if this is a broadcast or targeted message
                              let is_broadcast = packet.recipient_id.as_ref()
