@@ -8,7 +8,7 @@ name = "bitchat"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["full", "process"] }
+tokio = { version = "1", features = ["full", "process", "time"] }
 btleplug = "0.11"
 rand = "0.8"
 uuid = { version = "1", features = ["v4"] }
@@ -23,6 +23,11 @@ chrono = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 dirs = "5.0"
+base64 = "0.21"
+thiserror = "1.0"
+
+# For Noise
+snow = "0.9"
 
 # For Cryptography
 x25519-dalek = { version = "2.0", features = ["static_secrets", "getrandom"] }
