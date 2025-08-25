@@ -3225,7 +3225,7 @@ mod tests {
         assert_eq!(FLAG_HAS_RECIPIENT, 0x01);
         assert_eq!(FLAG_HAS_SIGNATURE, 0x02);
         assert_eq!(FLAG_IS_COMPRESSED, 0x04);
-        assert_eq!(FLAG_HAS_CHANNEL, 0x40);
+        assert_eq!(MSG_FLAG_HAS_CHANNEL, 0x40);
         assert_eq!(SIGNATURE_SIZE, 64);
         assert_eq!(BROADCAST_RECIPIENT, [0xFF; 8]);
     }
