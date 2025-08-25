@@ -3229,4 +3229,4 @@ mod tests {
         assert_eq!(SIGNATURE_SIZE, 64);
         assert_eq!(BROADCAST_RECIPIENT, [0xFF; 8]);
     }
-} 
+}
